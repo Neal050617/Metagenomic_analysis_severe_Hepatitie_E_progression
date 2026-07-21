@@ -1,0 +1,837 @@
+﻿# ==============================================================================
+# XGBoost Regression - Complete Final Version
+# Fixes: Circularity, Baseline model, Per-species permutation, No Mediation
+# ==============================================================================
+rm(list = ls())
+gc()
+
+# ---- Packages ----
+required_pkgs <- c("xgboost", "caret", "ggplot2", "openxlsx", "ggrepel", 
+                   "patchwork", "RColorBrewer", "viridis", "tidyr", "dplyr", 
+                   "ggdist", "MASS", "broom", "psych")
+for (pkg in required_pkgs) {
+    if (!require(pkg, character.only = TRUE, quietly = TRUE)) {
+        install.packages(pkg)
+        library(pkg, character.only = TRUE)
+    }
+}
+
+cat("===== XGBoost Regression - Complete Final Version =====\n\n")
+
+# ==============================================================================
+# 1. DATA LOADING
+# ==============================================================================
+file_path <- "haiyan_species (1).xlsx"
+species_data <- read.xlsx(file_path)
+
+num_cols <- c("Age", "BMI", "Final_Score", "TBA", "AST", "ALT", "TB", "DBIL", "CHE", "ALB", "PT")
+for (col in num_cols) {
+    if (col %in% names(species_data)) {
+        species_data[[col]] <- as.numeric(as.character(species_data[[col]]))
+    }
+}
+
+if ("Gender" %in% names(species_data)) {
+    g <- toupper(trimws(as.character(species_data$Gender)))
+    species_data$Gender_num <- ifelse(g %in% c("M", "MALE", "1", "BOY", "MAN"), 1, 0)
+}
+
+if (!"Final_Score" %in% names(species_data)) stop("Final_Score not found!")
+if (!"group" %in% names(species_data)) stop("group not found!")
+
+cat("Data dimensions:", dim(species_data), "\n")
+cat("Groups:", paste(unique(species_data$group), collapse = ", "), "\n")
+cat("NOTE: Final_Score is a composite of AST, TBA, PT, and CHE.\n")
+cat("Clinical-only model will show inflated R2 due to circularity.\n\n")
+
+# ==============================================================================
+# 2. SPECIES FILTERING
+# ==============================================================================
+species_cols <- names(species_data)[14:ncol(species_data)]
+cat("Initial species:", length(species_cols), "\n")
+
+detection_rates <- apply(species_data[species_cols], 2, function(x) sum(x > 0, na.rm = TRUE) / length(x))
+filtered <- species_cols[detection_rates >= 0.10]
+
+cv_values <- sapply(filtered, function(col) {
+    x <- species_data[[col]]
+    x_nz <- x[x > 0]
+    if (length(x_nz) > 1 && mean(x_nz) > 0) sd(x_nz) / mean(x_nz) else 0
+})
+final_species <- filtered[cv_values >= 0.5]
+cat("Final species after filtering:", length(final_species), "\n")
+
+# ==============================================================================
+# 3. CLR TRANSFORMATION
+# ==============================================================================
+clr_transform <- function(x) {
+    x_t <- x + 1
+    gm <- exp(mean(log(x_t)))
+    log(x_t / gm)
+}
+species_data_t <- species_data
+species_data_t[final_species] <- sapply(species_data[final_species], clr_transform)
+
+features_micro <- as.matrix(species_data_t[, final_species])
+target <- species_data$Final_Score
+raw_features <- as.matrix(species_data[, final_species])
+
+covars <- c("Age", "Gender_num", "BMI")
+cov_data <- species_data[, covars, drop = FALSE]
+cov_mat <- as.matrix(cov_data)
+
+# 临床指标（修订稿：TBA, AST, PT, CHE）
+clin_candidates <- c("TBA", "AST", "PT", "CHE")
+available_clin <- clin_candidates[clin_candidates %in% names(species_data)]
+if (length(available_clin) < 3) {
+    fallback <- c("ALT", "TB", "DBIL", "ALB")
+    available_clin <- unique(c(available_clin, fallback[fallback %in% names(species_data)]))
+}
+cat("Clinical indicators:", paste(available_clin, collapse = ", "), "\n")
+
+# 确保无缺失
+complete_idx <- complete.cases(cbind(features_micro, cov_mat, target, species_data[, available_clin]))
+features_micro <- features_micro[complete_idx, , drop = FALSE]
+raw_features <- raw_features[complete_idx, , drop = FALSE]
+cov_mat <- cov_mat[complete_idx, , drop = FALSE]
+target <- target[complete_idx]
+species_data_sub <- species_data[complete_idx, ]
+cat("Complete cases after NA removal:", length(target), "\n")
+
+X_clin <- as.matrix(species_data_sub[, available_clin])
+X_comb <- cbind(X_clin, features_micro)
+
+# ==============================================================================
+# 4. HELPERS
+# ==============================================================================
+calc_adj_r2 <- function(r2, n, p) {
+    if (is.na(r2) || n <= p + 1) return(NA_real_)
+    1 - (1 - r2) * (n - 1) / (n - p - 1)
+}
+
+safe_polr_multi <- function(formula, data) {
+    tryCatch({
+        mf <- model.frame(formula, data)
+        y <- mf[[1]]
+        x <- mf[, -1, drop = FALSE]
+        if (length(unique(y)) < 2) return(rep(0.333, ncol(x)))
+        if (any(apply(x, 2, sd, na.rm = TRUE) == 0)) return(rep(0.333, ncol(x)))
+        if (any(table(y) < 3)) return(rep(0.333, ncol(x)))
+        m <- polr(formula, data = data, Hess = TRUE)
+        coefs <- coef(m)
+        w <- abs(coefs) / sum(abs(coefs))
+        return(w)
+    }, error = function(e) {
+        return(rep(0.333, 3))
+    })
+}
+
+# ==============================================================================
+# 5. XGBOOST PARAMETERS
+# ==============================================================================
+params <- list(
+    objective = "reg:squarederror",
+    eval_metric = "rmse",
+    eta = 0.01,
+    max_depth = 3,
+    min_child_weight = 5,
+    subsample = 0.8,
+    colsample_bytree = 0.8,
+    alpha = 1,
+    lambda = 1,
+    tree_method = "hist"
+)
+
+# ==============================================================================
+# 6. BOOTSTRAP VALIDATION (Microbiome + Covariates)
+# ==============================================================================
+cat("\n--- Bootstrap Validation (100 iterations) ---\n")
+set.seed(123)
+n_boot <- 100
+boot_res <- data.frame()
+boot_imp <- list()
+
+for (b in 1:n_boot) {
+    if (b %% 20 == 0) cat("  Bootstrap:", b, "/", n_boot, "\n")
+    
+    train_idx <- sample(1:length(target), size = floor(0.8 * length(target)), replace = TRUE)
+    test_idx <- setdiff(1:length(target), unique(train_idx))
+    if (length(test_idx) < 5) next
+    
+    X_train <- cbind(features_micro[train_idx, ], cov_mat[train_idx, ])
+    X_test  <- cbind(features_micro[test_idx, ], cov_mat[test_idx, ])
+    
+    model <- xgb.train(
+        params = params,
+        data = xgb.DMatrix(data = X_train, label = target[train_idx]),
+        nrounds = 200,
+        verbose = 0
+    )
+    
+    pred_train <- predict(model, xgb.DMatrix(data = X_train))
+    pred_test  <- predict(model, xgb.DMatrix(data = X_test))
+    
+    y_tr <- target[train_idx]
+    y_te <- target[test_idx]
+    n_te <- length(y_te)
+    n_tr <- length(train_idx)
+    p <- ncol(X_train)
+    
+    r2_tr <- 1 - sum((y_tr - pred_train)^2) / sum((y_tr - mean(y_tr))^2)
+    r2_te <- 1 - sum((y_te - pred_test)^2) / sum((y_te - mean(y_te))^2)
+    adj_r2_te <- calc_adj_r2(r2_te, n_tr, p)
+    rmse_te <- sqrt(mean((y_te - pred_test)^2))
+    spearman_te <- cor(pred_test, y_te, method = "spearman")
+    
+    boot_res <- rbind(boot_res, data.frame(
+        Bootstrap = b, Train_R2 = r2_tr, Test_R2 = r2_te, 
+        Adj_R2 = adj_r2_te, RMSE = rmse_te, Spearman = spearman_te,
+        Test_N = n_te
+    ))
+    
+    imp <- xgb.importance(model = model, feature_names = colnames(X_train))
+    boot_imp[[b]] <- imp
+}
+
+boot_summary <- data.frame(
+    Metric = c("Mean_Test_R2", "Mean_RMSE", "Mean_Spearman",
+               "CI_R2_Lower", "CI_R2_Upper", "CI_RMSE_Lower", "CI_RMSE_Upper"),
+    Value = c(
+        mean(boot_res$Test_R2, na.rm = TRUE),
+        mean(boot_res$RMSE, na.rm = TRUE),
+        mean(boot_res$Spearman, na.rm = TRUE),
+        quantile(boot_res$Test_R2, 0.025, na.rm = TRUE),
+        quantile(boot_res$Test_R2, 0.975, na.rm = TRUE),
+        quantile(boot_res$RMSE, 0.025, na.rm = TRUE),
+        quantile(boot_res$RMSE, 0.975, na.rm = TRUE)
+    )
+)
+cat("\nBootstrap Performance (Microbiome-only):\n")
+print(boot_summary)
+
+# 重要性统计
+all_features <- unique(unlist(lapply(boot_imp, function(x) x$Feature)))
+imp_stats <- data.frame()
+for (feat in all_features) {
+    if (feat %in% covars) next
+    gains <- sapply(boot_imp, function(x) {
+        idx <- which(x$Feature == feat)
+        if (length(idx) > 0) x$Gain[idx] else NA
+    })
+    gains <- gains[!is.na(gains)]
+    if (length(gains) > 0) {
+        imp_stats <- rbind(imp_stats, data.frame(
+            Feature = feat, Mean_Gain = mean(gains), SD_Gain = sd(gains),
+            Presence = length(gains) / n_boot
+        ))
+    }
+}
+imp_stats <- imp_stats[order(-imp_stats$Mean_Gain), ]
+imp_stats$Rank <- 1:nrow(imp_stats)
+
+# ==============================================================================
+# 7. MULTI-DIMENSIONAL SPECIES ANALYSIS
+# ==============================================================================
+cat("\n--- Multi-dimensional Analysis ---\n")
+
+cor_res <- data.frame()
+for (sp in imp_stats$Feature) {
+    ct <- cor.test(species_data_sub[[sp]], target, method = "spearman")
+    cor_res <- rbind(cor_res, data.frame(
+        Feature = sp, Spearman_Rho = ct$estimate, Spearman_P = ct$p.value,
+        Corr_Abs = abs(ct$estimate),
+        Direction = ifelse(ct$estimate > 0, "Positive", "Negative")
+    ))
+}
+
+grp_ord <- factor(species_data_sub$group, levels = c("HC", "ANIH", "AIH", "ALF"), ordered = TRUE)
+mono_res <- data.frame()
+for (sp in imp_stats$Feature) {
+    mc <- cor(species_data_sub[[sp]], as.numeric(grp_ord), method = "spearman")
+    mono_res <- rbind(mono_res, data.frame(
+        Feature = sp, Mono_Signed = mc, Mono_Abs = abs(mc),
+        Mono_Dir = ifelse(mc > 0, "Increasing", ifelse(mc < 0, "Decreasing", "No trend"))
+    ))
+}
+
+X_full <- cbind(features_micro, cov_mat)
+final_model <- xgb.train(params = params, data = xgb.DMatrix(data = X_full, label = target),
+                         nrounds = 200, verbose = 0)
+pred_full <- predict(final_model, xgb.DMatrix(data = X_full))
+
+set.seed(42)
+n_samp <- min(50, nrow(X_full))
+samp_idx <- sample(1:nrow(X_full), n_samp)
+shap_c <- predict(final_model, xgb.DMatrix(data = X_full[samp_idx, ]), predcontrib = TRUE)
+if (ncol(shap_c) == ncol(X_full) + 1) shap_c <- shap_c[, -ncol(shap_c)]
+colnames(shap_c) <- colnames(X_full)
+
+shap_df <- data.frame(
+    Feature = colnames(shap_c),
+    SHAP_MeanAbs = colMeans(abs(shap_c)),
+    SHAP_Mean = colMeans(shap_c),
+    SHAP_SD = apply(shap_c, 2, sd)
+)
+shap_df <- shap_df[!shap_df$Feature %in% covars, ]
+
+all_res <- merge(imp_stats, cor_res, by = "Feature")
+all_res <- merge(all_res, mono_res, by = "Feature")
+all_res <- merge(all_res, shap_df, by = "Feature", all.x = TRUE)
+
+zscore <- function(x) { x[is.na(x)] <- 0; if (sd(x) == 0) return(rep(0, length(x))); (x - mean(x)) / sd(x) }
+all_res$Score_XGBoost <- zscore(all_res$Mean_Gain)
+all_res$Score_Correlation <- zscore(all_res$Corr_Abs)
+all_res$Score_Monotonicity <- zscore(all_res$Mono_Abs)
+all_res$Score_SHAP <- zscore(all_res$SHAP_MeanAbs)
+
+# ==============================================================================
+# 8. COMPOSITE SCORE (Strictly Matching Original Strategy)
+# ==============================================================================
+match_idx <- match(colnames(raw_features), all_res$Feature)
+
+score_xgb_vec <- all_res$Score_XGBoost[match_idx]
+score_xgb_vec[is.na(score_xgb_vec)] <- 0
+score_mono_vec <- all_res$Score_Monotonicity[match_idx]
+score_mono_vec[is.na(score_mono_vec)] <- 0
+score_corr_vec <- all_res$Score_Correlation[match_idx]
+score_corr_vec[is.na(score_corr_vec)] <- 0
+
+calc_sample_score <- function(idx) {
+    w <- raw_features[idx, ] + 1e-6
+    data.frame(
+        Score_XGBoost = weighted.mean(score_xgb_vec, w = w, na.rm = TRUE),
+        Score_Monotonicity = weighted.mean(score_mono_vec, w = w, na.rm = TRUE),
+        Score_Correlation = weighted.mean(score_corr_vec, w = w, na.rm = TRUE)
+    )
+}
+
+sample_scores_list <- lapply(1:nrow(raw_features), calc_sample_score)
+sample_scores_df <- do.call(rbind, sample_scores_list)
+sample_scores_df$Score_XGBoost <- as.numeric(scale(sample_scores_df$Score_XGBoost))
+sample_scores_df$Score_Monotonicity <- as.numeric(scale(sample_scores_df$Score_Monotonicity))
+sample_scores_df$Score_Correlation <- as.numeric(scale(sample_scores_df$Score_Correlation))
+
+sample_scores_full <- data.frame(
+    sample = species_data_sub$sample,
+    group = factor(species_data_sub$group, levels = c("HC", "ANIH", "AIH", "ALF"), ordered = TRUE),
+    Score_XGBoost = sample_scores_df$Score_XGBoost,
+    Score_Monotonicity = sample_scores_df$Score_Monotonicity,
+    Score_Correlation = sample_scores_df$Score_Correlation
+)
+
+fit_weights <- polr(group ~ Score_XGBoost + Score_Monotonicity + Score_Correlation,
+                    data = sample_scores_full, Hess = TRUE)
+coefs <- coef(fit_weights)
+weights <- abs(coefs) / sum(abs(coefs))
+names(weights) <- c("XGBoost", "Monotonicity", "Correlation")
+cat("Composite weights (full data):", round(weights, 4), "\n")
+
+all_res$Composite <- weights["XGBoost"] * all_res$Score_XGBoost + 
+    weights["Monotonicity"] * all_res$Score_Monotonicity + 
+    weights["Correlation"] * all_res$Score_Correlation
+all_res <- all_res[order(-all_res$Composite), ]
+all_res$Comp_Rank <- 1:nrow(all_res)
+all_res$Spearman_FDR <- p.adjust(all_res$Spearman_P, method = "fdr")
+
+cat("Top 5 species:\n")
+print(head(all_res[, c("Feature", "Composite", "Mean_Gain", "Corr_Abs", "Mono_Abs")], 5))
+
+# ==============================================================================
+# 9. 5-FOLD CV: FOUR MODEL COMPARISON (Circularity Acknowledged)
+# ==============================================================================
+cat("\n--- 5-fold CV: Four Model Comparison ---\n")
+
+cv_eval <- function(X, y, covs, nfolds = 5) {
+    set.seed(123)
+    folds <- createFolds(y, k = nfolds, list = TRUE)
+    out <- data.frame(R2 = numeric(nfolds), Adj_R2 = numeric(nfolds), RMSE = numeric(nfolds))
+    for (i in 1:nfolds) {
+        te <- folds[[i]]
+        tr <- setdiff(1:length(y), te)
+        if (is.null(X)) {
+            X_tr <- covs[tr, , drop = FALSE]
+            X_te <- covs[te, , drop = FALSE]
+        } else {
+            X_tr <- cbind(X[tr, ], covs[tr, ])
+            X_te <- cbind(X[te, ], covs[te, ])
+        }
+        dtr <- xgb.DMatrix(data = X_tr, label = y[tr])
+        dte <- xgb.DMatrix(data = X_te, label = y[te])
+        m <- xgb.train(params = list(objective = "reg:squarederror", eval_metric = "rmse",
+                                     eta = 0.05, max_depth = 4, subsample = 0.8, colsample_bytree = 0.8),
+                       data = dtr, nrounds = 200, evals = list(test = dte),
+                       early_stopping_rounds = 10, verbose = 0)
+        pr <- predict(m, dte)
+        n_tr <- length(tr)
+        p <- ncol(X_tr)
+        r2 <- 1 - sum((y[te] - pr)^2) / sum((y[te] - mean(y[te]))^2)
+        adj_r2 <- calc_adj_r2(r2, n_tr, p)
+        rmse <- sqrt(mean((y[te] - pr)^2))
+        out[i, ] <- c(r2, adj_r2, rmse)
+    }
+    colMeans(out)
+}
+
+res_baseline <- cv_eval(NULL, target, cov_mat)
+res_clin <- cv_eval(X_clin, target, cov_mat)
+res_micro <- cv_eval(features_micro, target, cov_mat)
+res_comb <- cv_eval(X_comb, target, cov_mat)
+
+model_comp <- data.frame(
+    Model = c("Baseline_only", "Clinical_only", "Microbiome_only", "Clinical_plus_Microbiome"),
+    R2 = c(res_baseline[1], res_clin[1], res_micro[1], res_comb[1]),
+    Adj_R2 = c(res_baseline[2], res_clin[2], res_micro[2], res_comb[2]),
+    RMSE = c(res_baseline[3], res_clin[3], res_micro[3], res_comb[3])
+)
+
+model_comp_print <- model_comp
+model_comp_print$Adj_R2 <- ifelse(is.na(model_comp_print$Adj_R2), 
+                                  "N/A (p>>n)", 
+                                  round(model_comp_print$Adj_R2, 3))
+cat("\nModel Comparison (5-fold CV):\n")
+print(model_comp_print)
+
+delta_micro_vs_baseline <- res_micro[1] - res_baseline[1]
+delta_comb_vs_clin <- res_comb[1] - res_clin[1]
+delta_comb_vs_baseline <- res_comb[1] - res_baseline[1]
+
+cat(sprintf("\nIncremental Value (Fair vs Baseline):\n"))
+cat(sprintf("  Micro vs Baseline:     DeltaR2 = %.4f\n", delta_micro_vs_baseline))
+cat(sprintf("  Combined vs Baseline:  DeltaR2 = %.4f\n", delta_comb_vs_baseline))
+cat(sprintf("  Combined vs Clinical:  DeltaR2 = %.4f (CEILING EFFECT; circular)\n", delta_comb_vs_clin))
+
+# ==============================================================================
+# 10. PERMUTATION TEST (Per-Species + Overall)
+# ==============================================================================
+cat("\n--- Permutation Test (Microbiome vs Baseline, Per-Species) ---\n")
+
+perm_test_micro_detailed <- function(X_micro, y, covs, n_perm = 100) {
+    set.seed(999)
+    train_idx <- sample(1:length(y), size = floor(0.8 * length(y)))
+    test_idx <- setdiff(1:length(y), train_idx)
+    y_te <- y[test_idx]
+    y_tr <- y[train_idx]
+    
+    # 真实模型
+    X_tr_micro <- cbind(X_micro[train_idx, ], covs[train_idx, ])
+    X_te_micro <- cbind(X_micro[test_idx, ], covs[test_idx, ])
+    m_micro <- xgb.train(params = list(objective = "reg:squarederror", eval_metric = "rmse",
+                                       eta = 0.05, max_depth = 4, subsample = 0.8, colsample_bytree = 0.8),
+                         data = xgb.DMatrix(data = X_tr_micro, label = y_tr), nrounds = 200, verbose = 0)
+    pred_micro <- predict(m_micro, xgb.DMatrix(data = X_te_micro))
+    r2_micro <- 1 - sum((y_te - pred_micro)^2) / sum((y_te - mean(y_te))^2)
+    
+    imp_true <- xgb.importance(model = m_micro, feature_names = colnames(X_tr_micro))
+    imp_true <- imp_true[!imp_true$Feature %in% c("Age", "Gender_num", "BMI"), ]
+    
+    # Baseline
+    X_tr_base <- covs[train_idx, ]
+    X_te_base <- covs[test_idx, ]
+    m_base <- xgb.train(params = list(objective = "reg:squarederror", eval_metric = "rmse",
+                                      eta = 0.05, max_depth = 4, subsample = 0.8, colsample_bytree = 0.8),
+                        data = xgb.DMatrix(data = X_tr_base, label = y_tr), nrounds = 200, verbose = 0)
+    pred_base <- predict(m_base, xgb.DMatrix(data = X_te_base))
+    r2_base <- 1 - sum((y_te - pred_base)^2) / sum((y_te - mean(y_te))^2)
+    
+    delta_true <- r2_micro - r2_base
+    
+    all_species <- colnames(X_micro)
+    n_species <- length(all_species)
+    perm_imp_matrix <- matrix(0, nrow = n_species, ncol = n_perm)
+    rownames(perm_imp_matrix) <- all_species
+    perm_delta <- numeric(n_perm)
+    
+    cat("  Running", n_perm, "permutations...\n")
+    
+    for (i in 1:n_perm) {
+        if (i %% 20 == 0) cat("    Permutation", i, "/", n_perm, "\n")
+        
+        perm_idx <- sample(nrow(X_micro))
+        X_perm <- X_micro[perm_idx, ]
+        
+        X_tr_p <- cbind(X_perm[train_idx, ], covs[train_idx, ])
+        X_te_p <- cbind(X_perm[test_idx, ], covs[test_idx, ])
+        m_p <- xgb.train(params = list(objective = "reg:squarederror", eval_metric = "rmse",
+                                       eta = 0.05, max_depth = 4, subsample = 0.8, colsample_bytree = 0.8),
+                         data = xgb.DMatrix(data = X_tr_p, label = y_tr), nrounds = 200, verbose = 0)
+        
+        pred_p <- predict(m_p, xgb.DMatrix(data = X_te_p))
+        r2_p <- 1 - sum((y_te - pred_p)^2) / sum((y_te - mean(y_te))^2)
+        perm_delta[i] <- r2_p - r2_base
+        
+        imp_p <- xgb.importance(model = m_p, feature_names = colnames(X_tr_p))
+        imp_p <- imp_p[!imp_p$Feature %in% c("Age", "Gender_num", "BMI"), ]
+        if (nrow(imp_p) > 0) {
+            match_idx <- match(imp_p$Feature, all_species)
+            valid <- !is.na(match_idx)
+            perm_imp_matrix[match_idx[valid], i] <- imp_p$Gain[valid]
+        }
+    }
+    
+    true_gain_vec <- numeric(n_species)
+    names(true_gain_vec) <- all_species
+    match_true <- match(imp_true$Feature, all_species)
+    valid_true <- !is.na(match_true)
+    true_gain_vec[match_true[valid_true]] <- imp_true$Gain[valid_true]
+    
+    species_perm_stats <- data.frame(
+        Species = all_species,
+        True_Gain = true_gain_vec,
+        Perm_Mean_Gain = rowMeans(perm_imp_matrix),
+        Perm_SD_Gain = apply(perm_imp_matrix, 1, sd),
+        Perm_p_value = sapply(1:n_species, function(j) {
+            if (true_gain_vec[j] == 0) return(1.0)
+            mean(perm_imp_matrix[j, ] >= true_gain_vec[j])
+        }),
+        stringsAsFactors = FALSE
+    )
+    
+    overall_p <- mean(perm_delta >= delta_true)
+    cat("  Overall DeltaR2 =", round(delta_true, 4), ", p =", round(overall_p, 4), "\n")
+    cat("  Species with Perm_p < 0.05:", sum(species_perm_stats$Perm_p_value < 0.05), "/", n_species, "\n")
+    
+    list(
+        delta_true = delta_true, r2_micro = r2_micro, r2_base = r2_base, 
+        perm_delta = perm_delta, overall_p = overall_p,
+        species_perm_stats = species_perm_stats
+    )
+}
+
+perm_res <- perm_test_micro_detailed(features_micro, target, cov_mat, n_perm = 100)
+
+species_perm_sorted <- perm_res$species_perm_stats[order(-perm_res$species_perm_stats$True_Gain), ]
+cat("\nTop 10 species by permutation test:\n")
+print(head(species_perm_sorted, 10))
+
+# ==============================================================================
+# 11. BOOTSTRAP FOR COMBINED MODEL (R2 & RMSE only)
+# ==============================================================================
+cat("\n--- Bootstrap for Combined Model ---\n")
+set.seed(456)
+n_boot2 <- 100
+boot_comb <- data.frame(R2 = numeric(n_boot2), RMSE = numeric(n_boot2))
+for (b in 1:n_boot2) {
+    idx <- sample(1:nrow(X_comb), replace = TRUE)
+    X_b <- cbind(X_comb[idx, ], cov_mat[idx, ])
+    y_b <- target[idx]
+    m <- xgb.train(params = list(objective = "reg:squarederror", eval_metric = "rmse",
+                                 eta = 0.05, max_depth = 4, subsample = 0.8, colsample_bytree = 0.8),
+                   data = xgb.DMatrix(data = X_b, label = y_b), nrounds = 200, verbose = 0)
+    pr <- predict(m, xgb.DMatrix(data = cbind(X_comb, cov_mat)))
+    r2 <- 1 - sum((target - pr)^2) / sum((target - mean(target))^2)
+    rmse <- sqrt(mean((target - pr)^2))
+    boot_comb[b, ] <- c(r2, rmse)
+}
+
+comb_summary <- data.frame(
+    Metric = c("Mean_R2", "Mean_RMSE", "CI_R2_Lower", "CI_R2_Upper",
+               "CI_RMSE_Lower", "CI_RMSE_Upper"),
+    Value = c(
+        mean(boot_comb$R2), mean(boot_comb$RMSE),
+        quantile(boot_comb$R2, 0.025), quantile(boot_comb$R2, 0.975),
+        quantile(boot_comb$RMSE, 0.025), quantile(boot_comb$RMSE, 0.975)
+    )
+)
+cat("\nCombined Model Bootstrap:\n")
+print(comb_summary)
+
+# ==============================================================================
+# 12. WEIGHT STABILITY (M5)
+# ==============================================================================
+cat("\n--- Weight Stability (5-fold CV) ---\n")
+weight_mat <- matrix(NA, nrow = 5, ncol = 3)
+colnames(weight_mat) <- c("XGBoost", "Monotonicity", "Correlation")
+
+set.seed(789)
+folds_w <- createFolds(target, k = 5, list = TRUE)
+for (i in 1:5) {
+    tr_idx <- setdiff(1:length(target), folds_w[[i]])
+    
+    tr_scores_list <- lapply(tr_idx, function(j) {
+        w <- raw_features[j, ] + 1e-6
+        data.frame(
+            Score_XGBoost = weighted.mean(score_xgb_vec, w = w, na.rm = TRUE),
+            Score_Monotonicity = weighted.mean(score_mono_vec, w = w, na.rm = TRUE),
+            Score_Correlation = weighted.mean(score_corr_vec, w = w, na.rm = TRUE)
+        )
+    })
+    tr_scores_df <- do.call(rbind, tr_scores_list)
+    
+    tr_data <- data.frame(
+        group = factor(species_data_sub$group[tr_idx], levels = c("HC", "ANIH", "AIH", "ALF"), ordered = TRUE),
+        Score_XGBoost = as.numeric(scale(tr_scores_df$Score_XGBoost)),
+        Score_Monotonicity = as.numeric(scale(tr_scores_df$Score_Monotonicity)),
+        Score_Correlation = as.numeric(scale(tr_scores_df$Score_Correlation))
+    )
+    
+    w_fit <- safe_polr_multi(group ~ Score_XGBoost + Score_Monotonicity + Score_Correlation, 
+                             data = tr_data)
+    weight_mat[i, ] <- w_fit
+}
+cat("Weight stability across 5 folds:\n")
+print(round(weight_mat, 4))
+cat("Mean (SD):", paste(round(colMeans(weight_mat), 3), "±", round(apply(weight_mat, 2, sd), 3)), "\n")
+
+# ==============================================================================
+# 13. SAMPLE SIZE (M9)
+# ==============================================================================
+cat("\n--- Sample Size Assessment ---\n")
+n_total <- nrow(species_data_sub)
+n_per_group <- table(species_data_sub$group)
+n_features <- ncol(features_micro)
+
+cat("Total n =", n_total, ", Microbial features =", n_features, "\n")
+cat("Per group:\n")
+print(n_per_group)
+cat("\nSample size adequacy:\n")
+cat("  Baseline model (p = 3):     Adequate\n")
+cat("  Clinical model (p =", length(available_clin), "):     Marginal\n")
+cat("  Microbiome models (p =", n_features, "):  Insufficient (n/p ≈", round(n_total/n_features, 2), ")\n")
+
+# ==============================================================================
+# 14. OUTPUTS
+# ==============================================================================
+dir.create("output_pdf", showWarnings = FALSE)
+dir.create("output_tables", showWarnings = FALSE)
+
+group_colors <- c("HC" = "#D97A5E", "ANIH" = "#3C405B", "AIH" = "#82B29A", "ALF" = "#F2CC8E")
+
+pdf("output_pdf/Fig1_Bootstrap_R2.pdf", width = 10, height = 7)
+p1 <- ggplot(boot_res, aes(x = Test_R2)) +
+    geom_histogram(fill = "#4ECDC4", alpha = 0.8, bins = 30, color = "white") +
+    geom_vline(xintercept = mean(boot_res$Test_R2), color = "#FF6B6B", linetype = "dashed", size = 1) +
+    labs(title = "Bootstrap Distribution of Test R²", x = expression(R^2), y = "Frequency") +
+    theme_minimal()
+print(p1)
+dev.off()
+
+pdf("output_pdf/Fig2_Model_Comparison.pdf", width = 10, height = 6)
+p2_data <- tidyr::pivot_longer(model_comp, cols = c("R2", "RMSE"), names_to = "Metric", values_to = "Value")
+p2 <- ggplot(p2_data, aes(x = Model, y = Value, fill = Metric)) +
+    geom_bar(stat = "identity", position = "dodge", alpha = 0.8) +
+    labs(title = "5-fold CV Model Comparison") +
+    theme_minimal() + theme(axis.text.x = element_text(angle = 15, hjust = 1))
+print(p2)
+dev.off()
+
+pdf("output_pdf/Fig3_Top20_Composite.pdf", width = 12, height = 8)
+top20 <- head(all_res, 20)
+p3 <- ggplot(top20, aes(x = reorder(Feature, Composite), y = Composite, fill = Mono_Dir)) +
+    geom_bar(stat = "identity", alpha = 0.8) + coord_flip() +
+    scale_fill_manual(values = c("Increasing" = "#FF6B6B", "Decreasing" = "#4ECDC4")) +
+    labs(title = "Top 20 Species by Composite Score") + theme_minimal()
+print(p3)
+dev.off()
+
+pdf("output_pdf/Fig4_Predicted_vs_Actual.pdf", width = 10, height = 8)
+pred_df <- data.frame(Actual = target, Predicted = pred_full, Group = species_data_sub$group)
+p4 <- ggplot(pred_df, aes(x = Actual, y = Predicted, color = Group)) +
+    geom_point(alpha = 0.6, size = 2) +
+    geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed") +
+    scale_color_manual(values = group_colors) +
+    labs(title = "Predicted vs Actual") + theme_minimal()
+print(p4)
+dev.off()
+
+pdf("output_pdf/Fig5_Residuals.pdf", width = 12, height = 6)
+resid <- pred_full - target
+res_df <- data.frame(Predicted = pred_full, Residual = resid, Group = species_data_sub$group)
+p5a <- ggplot(res_df, aes(x = Predicted, y = Residual, color = Group)) +
+    geom_point(alpha = 0.6) + geom_hline(yintercept = 0, color = "red", linetype = "dashed") +
+    scale_color_manual(values = group_colors) + theme_minimal()
+p5b <- ggplot(res_df, aes(x = Residual, fill = Group)) + geom_histogram(bins = 30, alpha = 0.7) +
+    scale_fill_manual(values = group_colors) + theme_minimal()
+p5 <- p5a + p5b + plot_annotation(title = "Residual Analysis")
+print(p5)
+dev.off()
+
+pdf("output_pdf/Fig6_Weight_Stability.pdf", width = 8, height = 6)
+w_df <- as.data.frame(weight_mat) %>% pivot_longer(everything(), names_to = "Dimension", values_to = "Weight")
+p6 <- ggplot(w_df, aes(x = Dimension, y = Weight, fill = Dimension)) +
+    geom_boxplot(alpha = 0.7) + geom_jitter(width = 0.1, size = 2) +
+    labs(title = "Weight Stability") + theme_minimal() + theme(legend.position = "none")
+print(p6)
+dev.off()
+
+pdf("output_pdf/Fig7_Permutation_Test.pdf", width = 8, height = 6)
+perm_df <- data.frame(DeltaR2 = perm_res$perm_delta)
+p7 <- ggplot(perm_df, aes(x = DeltaR2)) +
+    geom_histogram(fill = "gray70", alpha = 0.8, bins = 30) +
+    geom_vline(xintercept = perm_res$delta_true, color = "#FF6B6B", linetype = "dashed", size = 1) +
+    annotate("text", x = perm_res$delta_true, y = Inf, 
+             label = paste("Observed\np =", round(perm_res$overall_p, 4)), 
+             vjust = 2, hjust = -0.1, color = "#FF6B6B") +
+    labs(title = "Permutation Test: Microbiome vs Baseline",
+         x = expression(Delta*R^2), y = "Frequency") +
+    theme_minimal()
+print(p7)
+dev.off()
+cat("PDFs saved to output_pdf/\n")
+
+# ==============================================================================
+# 15. EXCEL OUTPUT
+# ==============================================================================
+wb <- createWorkbook()
+
+addWorksheet(wb, "Species_Analysis")
+writeData(wb, "Species_Analysis", all_res)
+
+addWorksheet(wb, "Bootstrap_MicroOnly")
+writeData(wb, "Bootstrap_MicroOnly", boot_summary)
+
+model_comp_excel <- model_comp
+model_comp_excel$Adj_R2 <- ifelse(is.na(model_comp_excel$Adj_R2), 
+                                  "N/A (p>>n)", 
+                                  as.character(round(model_comp_excel$Adj_R2, 3)))
+addWorksheet(wb, "Model_Comparison")
+writeData(wb, "Model_Comparison", model_comp_excel)
+
+addWorksheet(wb, "Bootstrap_Combined")
+writeData(wb, "Bootstrap_Combined", comb_summary)
+
+addWorksheet(wb, "Weight_Stability")
+writeData(wb, "Weight_Stability", as.data.frame(weight_mat))
+
+addWorksheet(wb, "Permutation_Test")
+writeData(wb, "Permutation_Test", data.frame(
+    Metric = c("True_DeltaR2_Micro_vs_Baseline", "Permutation_P_value", 
+               "R2_Microbiome", "R2_Baseline"),
+    Value = c(perm_res$delta_true, perm_res$overall_p, perm_res$r2_micro, perm_res$r2_base)
+))
+
+addWorksheet(wb, "Permutation_Per_Species")
+writeData(wb, "Permutation_Per_Species", species_perm_sorted)
+
+reviewer_summary <- data.frame(
+    Reviewer_Point = c("M3: Adj R2/RMSE", "M5: Weight stability", "M9: Sample size", 
+                       "M10: Causality", "M11: Incremental value (Circularity)", "Confounders"),
+    Response = c(
+        paste0("Baseline: AdjR2=", round(res_baseline[2], 3), 
+               "; Clinical: AdjR2=", round(res_clin[2], 3), 
+               "; Micro/Combined: N/A (p>>n). Clinical R2 inflated by circularity."),
+        paste0("Mean(SD): XGB=", round(mean(weight_mat[,1]), 3), "(", round(sd(weight_mat[,1]), 3), 
+               "), Mono=", round(mean(weight_mat[,2]), 3), "(", round(sd(weight_mat[,2]), 3), 
+               "), Corr=", round(mean(weight_mat[,3]), 3), "(", round(sd(weight_mat[,3]), 3), ")"),
+        paste0("N=", n_total, "; p_micro=", n_features, 
+               "; n/p=", round(n_total/n_features, 2), ". Insufficient for high-dim modeling."),
+        "No longitudinal/interventional data. Causality cannot be inferred.",
+        paste0("Micro vs Baseline: DeltaR2=", round(delta_micro_vs_baseline, 4), 
+               ", Permutation_p=", round(perm_res$overall_p, 4),
+               ". Clinical model circular (predicts own components)."),
+        "Age, Gender, BMI included. Medication/alcohol data not collected."
+    )
+)
+addWorksheet(wb, "Reviewer_Summary")
+writeData(wb, "Reviewer_Summary", reviewer_summary)
+
+saveWorkbook(wb, "output_tables/XGBoost_Reviewer_Response.xlsx", overwrite = TRUE)
+cat("Excel saved to output_tables/XGBoost_Reviewer_Response.xlsx\n")
+
+# 保存置换检验每个菌种的CSV
+write.csv(species_perm_sorted, "output_tables/Permutation_Per_Species_Stats.csv", row.names = FALSE)
+cat("Per-species permutation stats saved to: output_tables/Permutation_Per_Species_Stats.csv\n")
+
+# ==============================================================================
+# 16. FINAL SUMMARY
+# ==============================================================================
+cat("\n\n============================================================\n")
+cat("                 ANALYSIS COMPLETE                          \n")
+cat("============================================================\n")
+cat("CRITICAL: Clinical indicators ARE components of Final_Score.\n")
+cat("Clinical R2 =", round(res_clin[1], 3), "is inflated by circularity.\n\n")
+cat("Fair incremental value (Micro vs Baseline): DeltaR2 =", round(delta_micro_vs_baseline, 4), "\n")
+cat("Permutation p (Micro vs Baseline):            p =", round(perm_res$overall_p, 4), "\n")
+cat("Significant species (Perm_p < 0.05):         ", sum(species_perm_sorted$Perm_p_value < 0.05), "/", nrow(species_perm_sorted), "\n\n")
+cat("Clinical indicators:", paste(available_clin, collapse = ", "), "\n")
+cat(sprintf("  Baseline CV:       R2=%.3f, AdjR2=%.3f, RMSE=%.3f\n", 
+            res_baseline[1], res_baseline[2], res_baseline[3]))
+cat(sprintf("  Clinical-only CV:  R2=%.3f, AdjR2=%.3f, RMSE=%.3f  [INFLATED]\n", 
+            res_clin[1], res_clin[2], res_clin[3]))
+cat(sprintf("  Micro-only CV:     R2=%.3f, AdjR2=N/A, RMSE=%.3f\n", 
+            res_micro[1], res_micro[3]))
+cat(sprintf("  Combined CV:       R2=%.3f, AdjR2=N/A, RMSE=%.3f\n", 
+            res_comb[1], res_comb[3]))
+cat(sprintf("  Bootstrap Micro:   R2=%.3f [%.3f, %.3f]\n",
+            mean(boot_res$Test_R2), quantile(boot_res$Test_R2, 0.025), quantile(boot_res$Test_R2, 0.975)))
+cat(sprintf("  Weight (full):     XGB=%.3f, Mono=%.3f, Corr=%.3f\n",
+            weights["XGBoost"], weights["Monotonicity"], weights["Correlation"]))
+cat("============================================================\n")
+
+
+
+library(ggplot2)
+library(dplyr)
+library(ggrepel)
+
+# 构建数据（20 个示例点，请替换为您的完整 tier_data）
+tier_data <- data.frame(
+  Feature = c("Veillonella.atypica", "Veillonella.rogosae", "Dorea.longicatena",
+              "Roseburia.sp..MSJ-14", "Romboutsia.timonensis", "Eubacterium.ramulus",
+              "Anaeroglobus.micronuciformis", "Alitiscatomonas.sp900066535",
+              "Ligilactobacillus.salivarius",
+              "Lachnospira.eligens", "Flavonifractor.plautii", "Faecalibacterium.prausnitzii",
+              "Roseburia.porci", "Streptococcus.caecimuris", "Streptococcus.parasanguinis",
+              "Veillonella.dispar", "Veillonella.parvula", "Veillonella.parvula_A",
+              "Streptococcus.anginosus", "Veillonella.infantium"),
+  Composite_Rank = c(1, 2, 3, 11, 14, 18, 17, 47, 48,
+                     51, 52, 55, 19, 4, 5, 6, 8, 9, 22, 23),
+  Perm_p = c(0, 0, 0.04, 0, 0.01, 0.01, 0.03, 0.02, 0.04,
+             0, 0, 0.02, 1, 1, 1, 1, 1, 1, 1, 1),
+  Tier = c(rep("Tier 1 — Core", 9),
+           rep("Tier 2 — Supportive", 3),
+           rep("Tier 3 — Contextual", 8))
+)
+
+tier_data$neg_log10_p <- -log10(tier_data$Perm_p + 1e-300)
+
+# 定义分面面板
+tier_data$panel <- ifelse(tier_data$neg_log10_p > 1.0, 
+                          "A  Significant (p < 0.1)", 
+                          "B  Non-significant (p = 1.0)")
+
+# 关键：所有点都生成标签（将点替换为空格）
+tier_data$label <- gsub("\\.", " ", tier_data$Feature)
+
+# 绘图
+p_tier <- ggplot(tier_data, aes(x = Composite_Rank, y = neg_log10_p, color = Tier)) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "#374151", alpha = 0.6) +
+  annotate("text", x = 58, y = -log10(0.05), label = "p = 0.05", 
+           size = 3.5, color = "#374151", vjust = -0.8) +
+  geom_vline(xintercept = 50.5, linetype = "dashed", color = "#374151", alpha = 0.6) +
+  annotate("text", x = 52, y = max(tier_data$neg_log10_p) * 0.95, label = "Top 50\ncutoff", 
+           size = 3.5, color = "#374151", hjust = 0) +
+  geom_point(aes(size = Tier), alpha = 0.85, stroke = 0.3) +
+  # 关键修改：所有点都标注
+  ggrepel::geom_text_repel(
+    aes(label = label), 
+    size = 2.8,                    # 字号略小避免拥挤
+    max.overlaps = Inf,            # 强制显示所有标签
+    box.padding = 0.3, 
+    point.padding = 0.2,
+    segment.size = 0.25, 
+    min.segment.length = 0,          # 允许极短的引线
+    force = 1,                     # 降低排斥力，减少抖动
+    force_pull = 0.5               # 增加向点吸附的力
+  ) +
+  scale_color_manual(values = c("Tier 1 — Core" = "#dc2626",
+                                "Tier 2 — Supportive" = "#ea580c",
+                                "Tier 3 — Contextual" = "#9ca3af")) +
+  scale_size_manual(values = c("Tier 1 — Core" = 5,
+                               "Tier 2 — Supportive" = 4,
+                               "Tier 3 — Contextual" = 3.5)) +
+  facet_wrap(~panel, scales = "free_y", ncol = 1, strip.position = "top") +
+  labs(title = "Core Species Tier Classification",
+       subtitle = "All species annotated | Tier 1 = Core, Tier 2 = Supportive, Tier 3 = Contextual",
+       x = "Composite Score Rank",
+       y = "-log10(Permutation p-value)",
+       color = "Tier",
+       size = "Tier") +
+  theme_minimal() +
+  theme(legend.position = "bottom",
+        panel.grid.minor = element_blank(),
+        plot.title = element_text(face = "bold", size = 14),
+        strip.text = element_text(face = "bold", size = 12, color = "#374151"),
+        strip.background = element_rect(fill = "#f3f4f6", color = "#d1d5db"),
+        panel.spacing = unit(0.5, "lines"))
+
+ggsave("output_pdf/Fig_CoreSpecies_Tier_AllLabels.pdf", p_tier, width = 11, height = 10)

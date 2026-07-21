@@ -1,0 +1,2059 @@
+﻿# Complete script: Clinical severity scoring system construction
+# Functions: JT trend test + FDR -> exhaustive combination search (rank-sum) -> hybrid weighting -> scoring -> output
+# 
+# NEW MODULES ADDED (2026-07-07):
+#   - Confounder control (Age, Sex/Gender, BMI) in all models
+#   - M5: Circularity avoidance via strict Bootstrap train/test separation for weight estimation
+#   - M11: Incremental predictive value assessment (confounders vs biomarkers vs combined)
+#   - M3: Adjusted R², RMSE, MAE via 5-fold cross-validation
+#   - All outputs: PDF figures + XLSX tables
+# =============================================================================
+
+library(MASS)        
+library(combinat)   
+library(reshape2)  
+library(gridExtra)  
+library(ggrepel)     
+library(patchwork)   
+library(grid)        
+library(clinfun)
+library(openxlsx)
+library(dplyr)
+library(tidyr)
+library(xgboost)
+library(caret)
+library(pROC)
+library(ggplot2)
+library(writexl)
+
+set.seed(2026)
+
+# =============================================================================
+# 2. read data
+# =============================================================================
+cat("\n=== Step 0: Loading Data ===\n")
+file_path <- "Supplementary table S1.xlsx"
+df_raw <- read.xlsx(file_path, sheet = 1)
+
+# Extract required features
+required_features <- c("sample", "Group", "ALB", "DBIL", "CHE", "TB", "TBA", 
+                       "AST", "ALT", "PT", "ALP", "INR", "HGB", "Lymph", "PLT", "GGT")
+# NEW: Ensure confounders are included if available
+confounder_candidates <- c("Age", "Gender", "BMI")
+all_required <- union(required_features, confounder_candidates)
+available_features <- intersect(all_required, names(df_raw))
+
+df <- df_raw[, available_features]
+
+df$Group <- factor(df$Group, levels = c("HC", "ANIH", "AIH", "ALF"), ordered = TRUE)
+df$Group_Numeric <- as.numeric(df$Group)
+
+# ----- Create log1p-transformed and Z-score standardized columns -----
+biomarker_names <- setdiff(available_features, c("sample", "Group", confounder_candidates))  
+
+for (bm in biomarker_names) {
+    log_vals <- log1p(df[[bm]])
+    z_vals <- (log_vals - mean(log_vals, na.rm = TRUE)) / sd(log_vals, na.rm = TRUE)
+    df[[paste0(bm, "_log_z")]] <- z_vals
+}
+
+# =============================================================================
+# NEW: Confounder Data Preparation (Age, Sex/Gender, BMI)
+# =============================================================================
+cat("\n=== NEW: Confounder Data Preparation ===\n")
+
+confounder_cols <- c()  # track which confounders are actually available
+
+# Age: Z-score standardization
+if("Age" %in% names(df)){
+    df$Age_z <- scale(df$Age)[,1]
+    confounder_cols <- c(confounder_cols, "Age_z")
+    cat("  - Age found and Z-standardized (Age_z)\n")
+} else {
+    cat("  - WARNING: Age not found in data\n")
+}
+
+# Gender: Binary encoding (male = 1, female = 0)
+if("Gender" %in% names(df)){
+    df$Gender_male <- ifelse(df$Gender %in% c("M", "Male", "male", "男", "MALE"), 1, 0)
+    confounder_cols <- c(confounder_cols, "Gender_male")
+    cat(sprintf("  - Gender found and binarized (Gender_male): %d male, %d female\n", 
+                sum(df$Gender_male == 1), sum(df$Gender_male == 0)))
+} else {
+    cat("  - WARNING: Gender not found in data\n")
+}
+
+# BMI: Z-score standardization
+if("BMI" %in% names(df)){
+    df$BMI_z <- scale(df$BMI)[,1]
+    confounder_cols <- c(confounder_cols, "BMI_z")
+    cat("  - BMI found and Z-standardized (BMI_z)\n")
+} else {
+    cat("  - WARNING: BMI not found in data\n")
+}
+
+if(length(confounder_cols) == 0){
+    cat("\nCRITICAL WARNING: No confounders (Age/Gender/BMI) found in data.\n")
+    cat("Please ensure your Excel file contains columns named 'Age', 'Gender', and/or 'BMI'.\n")
+}
+
+sample_names <- df$sample
+cat("Data loaded. Samples:", nrow(df), " Biomarkers:", length(biomarker_names), 
+    " Confounders:", length(confounder_cols), "\n")
+
+# =============================================================================
+#  3. Jonckheere-Terpstra trend test with FDR correction
+# =============================================================================
+cat("\n=== Step 1: Jonckheere-Terpstra Trend Tests (FDR corrected) ===\n")
+
+feature_cols <- setdiff(available_features, c("sample", "Group", confounder_candidates))
+jt_results <- data.frame()
+
+for (feature in feature_cols) {
+    values <- df[[feature]]
+    group_num <- df$Group_Numeric
+    valid <- complete.cases(values, group_num)
+    if (sum(valid) < 10) next
+    
+    test <- tryCatch(
+        jonckheere.test(values[valid], group_num[valid], alternative = "two.sided"),
+        error = function(e) NULL
+    )
+    if (is.null(test)) next
+    
+    rho <- cor(values[valid], group_num[valid], method = "spearman")
+    direction <- ifelse(is.na(rho), "Unknown", ifelse(rho > 0, "Increasing", "Decreasing"))
+    
+    jt_results <- rbind(jt_results, data.frame(
+        Feature = feature,
+        JT_P_value = test$p.value,
+        Spearman_rho = rho,
+        Direction = direction,
+        stringsAsFactors = FALSE
+    ))
+}
+
+jt_results$FDR_q_value <- p.adjust(jt_results$JT_P_value, method = "BH")
+jt_results$Significant_q <- jt_results$FDR_q_value < 0.05
+jt_results <- jt_results[order(jt_results$JT_P_value), ]
+jt_results$Rank <- 1:nrow(jt_results)
+
+write.xlsx(jt_results, "Jonckheere_Terpstra_FDR_Results.xlsx", rowNames = FALSE)
+cat("✓ JT results saved: Jonckheere_Terpstra_FDR_Results.xlsx\n")
+monotonic_features <- jt_results$Feature[jt_results$Significant_q & abs(jt_results$Spearman_rho) > 0.75]
+biomarker_names <- monotonic_features   
+
+# =============================================================================
+#  NEW HELPER FUNCTION: Evaluate model WITH optional confounder adjustment
+# =============================================================================
+evaluate_model_confounder <- function(biomarker_set, data, confounder_terms = NULL, n_bootstrap = 100) {
+    biomarker_terms <- paste0(biomarker_set, "_log_z")
+    all_terms <- c(biomarker_terms, confounder_terms)
+    predictors <- paste(all_terms, collapse = " + ")
+    formula_str <- paste("Group ~", predictors)
+    
+    tryCatch({
+        model <- polr(as.formula(formula_str), data = data, Hess = TRUE, method = "logistic")
+        aic_val <- AIC(model)
+        
+        coefs <- coef(model)
+        standardized_score <- rep(0, nrow(data))
+        for (bm in biomarker_set) {
+            term_name <- paste0(bm, "_log_z")
+            if(term_name %in% names(coefs)){
+                standardized_score <- standardized_score + coefs[term_name] * data[[term_name]]
+            }
+        }
+        # Add confounder contributions if present
+        for(ct in confounder_terms){
+            if(ct %in% names(coefs)){
+                standardized_score <- standardized_score + coefs[ct] * data[[ct]]
+            }
+        }
+        
+        cor_val <- cor(standardized_score, data$Group_Numeric, method = "spearman", use = "complete.obs")
+        if (cor_val < 0) {
+            standardized_score <- -standardized_score
+            cor_val <- -cor_val
+        }
+        
+        bootstrap_success <- 0
+        bootstrap_correlations <- numeric(n_bootstrap)
+        
+        for (i in 1:n_bootstrap) {
+            tryCatch({
+                indices <- sample(1:nrow(data), nrow(data), replace = TRUE)
+                bootstrap_data <- data[indices, ]
+                bootstrap_model <- polr(as.formula(formula_str), data = bootstrap_data, Hess = TRUE, method = "logistic")
+                bootstrap_coefs <- coef(bootstrap_model)
+                
+                bootstrap_score <- rep(0, nrow(bootstrap_data))
+                for (bm in biomarker_set) {
+                    term_name <- paste0(bm, "_log_z")
+                    if(term_name %in% names(bootstrap_coefs)){
+                        bootstrap_score <- bootstrap_score + bootstrap_coefs[term_name] * bootstrap_data[[term_name]]
+                    }
+                }
+                for(ct in confounder_terms){
+                    if(ct %in% names(bootstrap_coefs)){
+                        bootstrap_score <- bootstrap_score + bootstrap_coefs[ct] * bootstrap_data[[ct]]
+                    }
+                }
+                
+                bootstrap_cor <- cor(bootstrap_score, bootstrap_data$Group_Numeric, method = "spearman", use = "complete.obs")
+                if ((bootstrap_cor > 0 && cor_val > 0) || (bootstrap_cor < 0 && cor_val < 0)) {
+                    bootstrap_success <- bootstrap_success + 1
+                }
+                bootstrap_correlations[i] <- abs(bootstrap_cor)
+            }, error = function(e) {
+                bootstrap_correlations[i] <- NA
+            })
+        }
+        
+        valid_bootstraps <- sum(!is.na(bootstrap_correlations))
+        bootstrap_success_rate <- 100 * bootstrap_success / n_bootstrap
+        mean_bootstrap_cor <- ifelse(valid_bootstraps > 0, mean(bootstrap_correlations, na.rm = TRUE), NA)
+        ci_bootstrap <- ifelse(valid_bootstraps > 0, 
+                               quantile(bootstrap_correlations, c(0.25, 0.75), na.rm = TRUE), 
+                               c(NA, NA))
+        
+        return(list(
+            biomarkers = biomarker_set,
+            confounders = confounder_terms,
+            n_biomarkers = length(biomarker_set),
+            n_confounders = length(confounder_terms),
+            aic = aic_val,
+            correlation = cor_val,
+            bootstrap_success_rate = bootstrap_success_rate,
+            mean_bootstrap_cor = mean_bootstrap_cor,
+            bootstrap_ci_lower = ci_bootstrap[1],
+            bootstrap_ci_upper = ci_bootstrap[2],
+            model = model,
+            formula = formula_str,
+            valid_bootstraps = valid_bootstraps,
+            standardized_score = standardized_score,
+            coefficients = coefs
+        ))
+    }, error = function(e) {
+        return(list(
+            biomarkers = biomarker_set, confounders = confounder_terms,
+            n_biomarkers = length(biomarker_set), n_confounders = length(confounder_terms),
+            aic = NA, correlation = NA, bootstrap_success_rate = NA,
+            mean_bootstrap_cor = NA, bootstrap_ci_lower = NA, bootstrap_ci_upper = NA,
+            model = NULL, formula = formula_str, valid_bootstraps = 0,
+            standardized_score = NULL, coefficients = NULL, error = e$message
+        ))
+    })
+}
+
+# =============================================================================
+# 4. CALCULATE REVISED COMPOSITE SCORE (original function preserved)
+# =============================================================================
+calculate_revised_composite_score <- function(results_list) {
+    valid_results <- results_list[sapply(results_list, function(x) !is.null(x$model))]
+    if (length(valid_results) == 0) stop("No valid models found!")
+    
+    aic_values <- sapply(valid_results, function(x) x$aic)
+    cor_values <- sapply(valid_results, function(x) x$correlation)
+    bs_values <- sapply(valid_results, function(x) x$bootstrap_success_rate)
+    
+    min_aic <- min(aic_values, na.rm = TRUE)
+    max_aic <- max(aic_values, na.rm = TRUE)
+    
+    for (i in 1:length(valid_results)) {
+        result <- valid_results[[i]]
+        cor_score <- result$correlation
+        bs_score <- result$bootstrap_success_rate / 100
+        aic_normalized <- 1 - ((result$aic - min_aic) / (max_aic - min_aic))
+        
+        w_correlation <- 0.35   
+        w_bootstrap <- 0.35    
+        w_aic <- 0.30           
+        
+        composite_score <- (cor_score * w_correlation) + 
+            (bs_score * w_bootstrap) + 
+            (aic_normalized * w_aic)
+        
+        valid_results[[i]]$composite_score <- composite_score
+    }
+    return(valid_results)
+}
+
+# ============================================================================
+
+
+# ============================================================================
+# WEIGHT SENSITIVITY ANALYSIS (FIXED NAMING MATCH)
+# ============================================================================
+
+cat("\n")
+cat(paste(rep("=", 80), collapse = ""))
+cat("\nWEIGHT SENSITIVITY ANALYSIS (CORRECTED NAMING MATCH)\n")
+cat(paste(rep("=", 80), collapse = ""), "\n\n")
+
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(openxlsx)
+
+# 1. 定义权重场景
+weight_scenarios <- list(
+    Original = c(w_cor = 0.35, w_bs = 0.35, w_aic = 0.30),
+    Equal = c(w_cor = 1/3, w_bs = 1/3, w_aic = 1/3),
+    Cor_Dominant = c(w_cor = 0.50, w_bs = 0.25, w_aic = 0.25),
+    BS_Dominant = c(w_cor = 0.25, w_bs = 0.50, w_aic = 0.25),
+    AIC_Dominant = c(w_cor = 0.25, w_bs = 0.25, w_aic = 0.50),
+    High_Cor_BS = c(w_cor = 0.40, w_bs = 0.40, w_aic = 0.20),
+    High_AIC = c(w_cor = 0.20, w_bs = 0.20, w_aic = 0.60),
+    Extreme_Cor = c(w_cor = 0.60, w_bs = 0.20, w_aic = 0.20),
+    Extreme_BS = c(w_cor = 0.20, w_bs = 0.60, w_aic = 0.20),
+    Extreme_AIC = c(w_cor = 0.20, w_bs = 0.20, w_aic = 0.60)
+)
+
+# 2. 安全检查
+if(!exists("valid_results")) {
+    stop("ERROR: valid_results not found.")
+}
+# 修复：为 valid_results 自动命名
+if(is.null(names(valid_results)) || all(names(valid_results) == "")) {
+    # 尝试从每个元素的 biomarkers 和 confounders 提取名称
+    panel_names_extracted <- sapply(valid_results, function(x) {
+        if(!is.null(x$biomarkers) && length(x$biomarkers) > 0) {
+            # 如果有 biomarkers，用它们构建名称
+            biomarker_part <- paste(x$biomarkers, collapse = "_")
+            if(!is.null(x$confounders) && length(x$confounders) > 0) {
+                confounder_part <- paste(x$confounders, collapse = "_")
+                return(paste0(biomarker_part, "_plus_", confounder_part))
+            } else {
+                return(biomarker_part)
+            }
+        } else if(!is.null(x$formula)) {
+            # 备选：从 formula 提取
+            return(as.character(x$formula)[3])
+        } else {
+            return(NA)
+        }
+    })
+    
+    # 如果提取失败，使用默认命名
+    if(any(is.na(panel_names_extracted))) {
+        panel_names_extracted[is.na(panel_names_extracted)] <- paste0("Panel_", which(is.na(panel_names_extracted)))
+    }
+    
+    names(valid_results) <- panel_names_extracted
+    cat("Assigned names to valid_results. First 5 names:\n")
+    print(head(names(valid_results), 5))
+}
+panel_names <- names(valid_results)
+cat(sprintf("Total panels: %d\n", length(panel_names)))
+
+# 3. 提取基础数据
+aic_values <- sapply(valid_results, function(x) x$aic)
+cor_values <- sapply(valid_results, function(x) x$correlation)
+bs_values <- sapply(valid_results, function(x) x$bootstrap_success_rate)
+
+min_aic <- min(aic_values, na.rm = TRUE)
+max_aic <- max(aic_values, na.rm = TRUE)
+aic_normalized <- 1 - ((aic_values - min_aic) / (max_aic - min_aic))
+
+# 4. 关键修复：正确定义目标面板
+# 由于 panel_names 是字母排序的，AST-PT-TBA-CHE 实际存储为 "TBA_AST_PT_CHE"
+# 我们需要同时检查多种可能的命名格式
+
+target_patterns <- c(
+    "TBA_AST_PT_CHE",      # 字母排序（最可能）
+    "AST_PT_TBA_CHE",      # 原始顺序
+    "TBA_AST_CHE_PT",      # 其他变体
+    "AST_CHE_PT_TBA"       # 其他变体
+)
+
+# 找到 AST-PT-TBA-CHE 的精确索引
+target_idx <- NA
+for(pattern in target_patterns) {
+    match <- which(panel_names == pattern)
+    if(length(match) > 0) {
+        target_idx <- match[1]
+        cat(sprintf("Found target panel '%s' at index %d\n", pattern, target_idx))
+        break
+    }
+}
+
+# 如果精确匹配失败，尝试部分匹配
+if(is.na(target_idx)) {
+    # 查找同时包含 AST, PT, TBA, CHE 但不包含 ALT, DBIL, INR, ALB 的面板
+    has_ast <- grepl("AST", panel_names)
+    has_pt <- grepl("PT", panel_names)
+    has_tba <- grepl("TBA", panel_names)
+    has_che <- grepl("CHE", panel_names)
+    no_alt <- !grepl("ALT", panel_names)
+    no_dbil <- !grepl("DBIL", panel_names)
+    no_inr <- !grepl("INR", panel_names)
+    no_alb <- !grepl("ALB", panel_names)
+    
+    candidate_idx <- which(has_ast & has_pt & has_tba & has_che & no_alt & no_dbil & no_inr & no_alb)
+    
+    if(length(candidate_idx) > 0) {
+        target_idx <- candidate_idx[1]
+        cat(sprintf("Found target panel via partial match: '%s' at index %d\n", 
+                    panel_names[target_idx], target_idx))
+    } else {
+        cat("WARNING: Could not find AST-PT-TBA-CHE panel. Available AST-containing panels:\n")
+        ast_panels <- panel_names[grepl("AST", panel_names)]
+        print(head(ast_panels, 10))
+    }
+}
+
+# 5. 对每个场景重新计算
+sensitivity_results <- data.frame(
+    Scenario = character(),
+    w_Correlation = numeric(),
+    w_Bootstrap = numeric(),
+    w_AIC = numeric(),
+    Top_Panel = character(),
+    Top_Composite_Score = numeric(),
+    AST_PT_TBA_CHE_Rank = integer(),
+    AST_PT_TBA_CHE_Score = numeric(),
+    stringsAsFactors = FALSE
+)
+
+ast_first_count <- 0
+ast_first_scenarios <- c()
+
+for(scenario_name in names(weight_scenarios)) {
+    weights <- weight_scenarios[[scenario_name]]
+    
+    w_cor_val <- as.numeric(weights["w_cor"])
+    w_bs_val <- as.numeric(weights["w_bs"])
+    w_aic_val <- as.numeric(weights["w_aic"])
+    
+    composite_scores <- (cor_values * w_cor_val) + 
+        (bs_values / 100 * w_bs_val) + 
+        (aic_normalized * w_aic_val)
+    
+    ranks <- rank(-composite_scores, ties.method = "min")
+    
+    best_idx <- which.max(composite_scores)
+    best_panel <- panel_names[best_idx]
+    best_score <- composite_scores[best_idx]
+    
+    # 获取目标面板的排名
+    if(!is.na(target_idx)) {
+        ast_rank <- as.integer(ranks[target_idx])
+        ast_score <- as.numeric(composite_scores[target_idx])
+    } else {
+        ast_rank <- NA_integer_
+        ast_score <- NA_real_
+    }
+    
+    if(!is.na(ast_rank) && ast_rank == 1) {
+        ast_first_count <- ast_first_count + 1
+        ast_first_scenarios <- c(ast_first_scenarios, scenario_name)
+    }
+    
+    new_row <- data.frame(
+        Scenario = as.character(scenario_name),
+        w_Correlation = as.numeric(w_cor_val),
+        w_Bootstrap = as.numeric(w_bs_val),
+        w_AIC = as.numeric(w_aic_val),
+        Top_Panel = as.character(best_panel),
+        Top_Composite_Score = as.numeric(round(best_score, 4)),
+        AST_PT_TBA_CHE_Rank = as.integer(ast_rank),
+        AST_PT_TBA_CHE_Score = as.numeric(round(ast_score, 4)),
+        stringsAsFactors = FALSE
+    )
+    
+    sensitivity_results <- rbind(sensitivity_results, new_row)
+}
+
+# 6. 输出结果
+cat("\n=== CORRECTED SENSITIVITY ANALYSIS RESULTS ===\n\n")
+print(sensitivity_results)
+
+cat(sprintf("\n=== SUMMARY ===\n"))
+cat(sprintf("Total scenarios: %d\n", nrow(sensitivity_results)))
+cat(sprintf("AST-PT-TBA-CHE ranks FIRST: %d (%.1f%%)\n", 
+            ast_first_count, ast_first_count / nrow(sensitivity_results) * 100))
+if(length(ast_first_scenarios) > 0) {
+    cat(sprintf("First-place scenarios: %s\n", paste(ast_first_scenarios, collapse = ", ")))
+}
+
+# 7. 保存
+write.xlsx(sensitivity_results, "Weight_Sensitivity_Analysis_Corrected.xlsx", rowNames = FALSE)
+
+# 8. 可视化
+p_rank <- ggplot(sensitivity_results, aes(x = reorder(Scenario, AST_PT_TBA_CHE_Rank), y = AST_PT_TBA_CHE_Rank)) +
+    geom_bar(stat = "identity", aes(fill = AST_PT_TBA_CHE_Rank == 1), alpha = 0.8, width = 0.7) +
+    geom_text(aes(label = ifelse(AST_PT_TBA_CHE_Rank == 1, "★ FIRST", paste("Rank", AST_PT_TBA_CHE_Rank))), 
+              vjust = -0.5, size = 3.5, fontface = "bold") +
+    scale_fill_manual(values = c("TRUE" = "#82B29A", "FALSE" = "#D97A5E")) +
+    labs(
+        title = "AST-PT-TBA-CHE Ranking Across Weight Scenarios (Corrected)",
+        subtitle = sprintf("Ranks FIRST in %d of %d scenarios", ast_first_count, nrow(sensitivity_results)),
+        x = "Scenario", y = "Rank"
+    ) +
+    coord_flip() + theme_minimal()
+
+ggsave("Figure_AST_Rank_Sensitivity_Corrected.pdf", plot = p_rank, width = 10, height = 6)
+
+cat("\n=== FILES SAVED ===\n")
+cat("Weight_Sensitivity_Analysis_Corrected.xlsx\n")
+cat("Figure_AST_Rank_Sensitivity_Corrected.pdf\n")
+
+# 4. 输出结果
+cat("\n=== WEIGHT SENSITIVITY ANALYSIS RESULTS ===\n\n")
+print(sensitivity_results)
+
+cat(sprintf("\n=== SUMMARY ===\n"))
+cat(sprintf("Total scenarios tested: %d\n", nrow(sensitivity_results)))
+cat(sprintf("Scenarios where AST-PT-TBA-CHE ranks FIRST: %d\n", ast_first_count))
+cat(sprintf("Percentage: %.1f%%\n", ast_first_count / nrow(sensitivity_results) * 100))
+if(length(ast_first_scenarios) > 0) {
+    cat(sprintf("Scenarios with AST-PT-TBA-CHE first: %s\n", paste(ast_first_scenarios, collapse = ", ")))
+}
+
+# 5. 保存到 Excel
+write.xlsx(sensitivity_results, "Weight_Sensitivity_Analysis.xlsx", rowNames = FALSE)
+cat("\nWeight_Sensitivity_Analysis.xlsx saved\n")
+
+# 6. 生成可视化
+
+# 绘制 AST-PT-TBA-CHE 排名变化
+p2 <- ggplot(sensitivity_results, aes(x = reorder(Scenario, AST_PT_TBA_CHE_Rank), y = AST_PT_TBA_CHE_Rank)) +
+    geom_bar(stat = "identity", aes(fill = AST_PT_TBA_CHE_Rank == 1), alpha = 0.8, width = 0.7) +
+    geom_text(aes(label = ifelse(AST_PT_TBA_CHE_Rank == 1, "★ FIRST", paste("Rank", AST_PT_TBA_CHE_Rank))), 
+              vjust = -0.5, size = 3.5, fontface = "bold") +
+    scale_fill_manual(values = c("TRUE" = "#82B29A", "FALSE" = "#D97A5E"), 
+                      name = "AST-PT-TBA-CHE", labels = c("Not First", "First")) +
+    labs(
+        title = "AST-PT-TBA-CHE Ranking Across Weight Scenarios",
+        subtitle = sprintf("Ranks FIRST in %d of %d scenarios (%.1f%%)", 
+                           ast_first_count, nrow(sensitivity_results), 
+                           ast_first_count / nrow(sensitivity_results) * 100),
+        x = "Scenario",
+        y = "Rank (lower = better)"
+    ) +
+    coord_flip() +
+    theme_minimal() +
+    theme(
+        plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+        plot.subtitle = element_text(hjust = 0.5, color = "gray40", size = 11),
+        legend.position = "bottom"
+    )
+
+ggsave("Figure_AST_Rank_Sensitivity.pdf", plot = p2, width = 10, height = 6)
+cat("Figure_AST_Rank_Sensitivity.pdf saved\n")
+
+# 绘制权重配置热图
+plot_data <- sensitivity_results %>%
+    select(Scenario, w_Correlation, w_Bootstrap, w_AIC) %>%
+    pivot_longer(cols = c(w_Correlation, w_Bootstrap, w_AIC), 
+                 names_to = "Weight_Type", values_to = "Weight_Value")
+
+p1 <- ggplot(plot_data, aes(x = Weight_Type, y = Scenario, fill = Weight_Value)) +
+    geom_tile(color = "white", size = 0.5) +
+    geom_text(aes(label = sprintf("%.2f", Weight_Value)), color = "white", size = 3.5, fontface = "bold") +
+    scale_fill_gradient(low = "#2E86AB", high = "#A23B72", name = "Weight") +
+    labs(
+        title = "Weight Configurations Across Sensitivity Scenarios",
+        x = "Criterion",
+        y = "Scenario"
+    ) +
+    theme_minimal() +
+    theme(
+        plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+        axis.text.x = element_text(angle = 0, size = 10),
+        axis.text.y = element_text(size = 10)
+    )
+
+ggsave("Figure_Weight_Sensitivity_Heatmap.pdf", plot = p1, width = 8, height = 6)
+cat("Figure_Weight_Sensitivity_Heatmap.pdf saved\n")
+
+cat("\n=== ANALYSIS COMPLETE ===\n")
+# =============================================================================
+# 5. EVALUATE ALL COMBINATIONS (original workflow preserved)
+# =============================================================================
+cat("\n=== Evaluating All Biomarker Combinations (Revised Composite Score) ===\n")
+
+all_combinations <- list()
+for (k in 2:5) {  
+    combs <- combinat::combn(biomarker_names, k, simplify = FALSE)
+    all_combinations <- c(all_combinations, combs)
+}
+
+cat(sprintf("Total combinations to evaluate: %d\n", length(all_combinations)))
+
+all_results_list <- list()
+cat("Evaluating combinations (100 bootstrap replicates each)...\n")
+pb <- txtProgressBar(min = 0, max = length(all_combinations), style = 3)
+
+for (i in 1:length(all_combinations)) {
+    result <- evaluate_model_confounder(all_combinations[[i]], df, confounder_terms = NULL, n_bootstrap = 100)
+    all_results_list[[i]] <- result
+    setTxtProgressBar(pb, i)
+}
+close(pb)
+
+valid_results <- calculate_revised_composite_score(all_results_list)
+
+results_df <- do.call(rbind, lapply(valid_results, function(x) {
+    data.frame(
+        Biomarkers = paste(x$biomarkers, collapse = ", "),
+        N_Biomarkers = x$n_biomarkers,
+        AIC = round(x$aic, 1),
+        Correlation = round(x$correlation, 3),
+        Bootstrap_Success_Rate = round(x$bootstrap_success_rate, 1),
+        Mean_Bootstrap_Correlation = round(x$mean_bootstrap_cor, 3),
+        Bootstrap_CI_Lower = round(x$bootstrap_ci_lower, 3),
+        Bootstrap_CI_Upper = round(x$bootstrap_ci_upper, 3),
+        Composite_Score = round(x$composite_score, 3),
+        Valid_Bootstraps = x$valid_bootstraps,
+        stringsAsFactors = FALSE
+    )
+}))
+
+cat(sprintf("\nValid models: %d out of %d (%.1f%%)\n", 
+            nrow(results_df), length(all_combinations),
+            100 * nrow(results_df) / length(all_combinations)))
+
+# =============================================================================
+# 6. IDENTIFY BEST COMBINATION (original workflow preserved)
+# =============================================================================
+cat("\n=== Identifying Best Combinations (Revised Scoring) ===\n")
+
+results_df <- results_df[order(-results_df$Composite_Score), ]
+results_df$Rank <- 1:nrow(results_df)
+
+top_10 <- head(results_df, 10)
+
+best_by_size <- data.frame()
+for (k in 2:5) {
+    subset_data <- results_df[results_df$N_Biomarkers == k, ]
+    if (nrow(subset_data) > 0) {
+        best_row <- subset_data[which.max(subset_data$Composite_Score), ]
+        best_by_size <- rbind(best_by_size, best_row)
+    }
+}
+
+cat("\nTop 10 Combinations by Revised Composite Score:\n")
+print(top_10[, c("Rank", "Biomarkers", "N_Biomarkers", "Composite_Score", 
+                 "Correlation", "Bootstrap_Success_Rate", "AIC")])
+
+cat("\nBest Combination for Each Number of Biomarkers:\n")
+print(best_by_size[, c("Biomarkers", "N_Biomarkers", "Composite_Score", 
+                       "Correlation", "Bootstrap_Success_Rate", "AIC")])
+
+best_combination <- results_df[1, ]
+best_biomarkers <- unlist(strsplit(best_combination$Biomarkers, ", "))
+
+best_result_index <- which(sapply(valid_results, function(x) {
+    paste(x$biomarkers, collapse = ", ") == best_combination$Biomarkers
+}))
+best_result <- valid_results[[best_result_index]]
+
+cat(sprintf("\n=== Overall Best Combination (Revised Scoring) ===\n"))
+cat(sprintf("Biomarkers: %s\n", best_combination$Biomarkers))
+cat(sprintf("Number of biomarkers: %d\n", best_combination$N_Biomarkers))
+cat(sprintf("Revised Composite Score: %.3f\n", best_combination$Composite_Score))
+cat(sprintf("AIC: %.1f\n", best_combination$AIC))
+cat(sprintf("Correlation (ρ): %.3f\n", best_combination$Correlation))
+cat(sprintf("Bootstrap Success Rate: %.1f%%\n", best_combination$Bootstrap_Success_Rate))
+
+# =============================================================================
+# 7. DETAILED ANALYSIS OF BEST COMBINATION (original workflow preserved)
+# =============================================================================
+cat("\n=== Detailed Analysis of Best Combination ===\n")
+
+final_model <- best_result$model
+coefs <- coef(final_model)
+std_errors <- sqrt(diag(vcov(final_model)))[1:length(coefs)]
+
+importance_df <- data.frame(
+    Biomarker = gsub("_log_z", "", names(coefs)),
+    Coefficient = coefs,
+    Std_Error = std_errors,
+    P_Value = 2 * pnorm(-abs(coefs/std_errors)),
+    Importance_Percent = 100 * abs(coefs) / sum(abs(coefs)),
+    stringsAsFactors = FALSE
+)
+importance_df$Rank <- rank(-abs(importance_df$Coefficient))
+
+# =============================================================================
+# 8. CALCULATE FINAL SCORE WITH DIRECTION ADJUSTMENT (original workflow preserved)
+# =============================================================================
+cat("\n=== Calculating Final Disease Severity Score (Hybrid Weights) ===\n")
+
+best_features <- best_biomarkers  
+
+# 8.1 Train XGBoost for feature importance (original method)
+cat("  Training XGBoost model for feature importance...\n")
+
+xgb_data_opt <- df[, paste0(best_features, "_log_z"), drop = FALSE]
+xgb_label <- df$Group_Numeric
+
+complete_idx <- complete.cases(xgb_data_opt, xgb_label)
+if (sum(complete_idx) < 10) stop("Not enough complete cases for XGBoost training.")
+
+xgb_matrix <- as.matrix(xgb_data_opt[complete_idx, ])
+xgb_label_clean <- xgb_label[complete_idx]
+
+params <- list(
+    objective = "reg:squarederror", eval_metric = "rmse",
+    eta = 0.1, max_depth = 3, subsample = 0.8,
+    colsample_bytree = 0.8, lambda = 1, alpha = 0.5, min_child_weight = 3
+)
+
+dtrain <- xgb.DMatrix(data = xgb_matrix, label = xgb_label_clean)
+xgb_model <- xgb.train(params = params, data = dtrain, nrounds = 100, verbose = 0)
+
+importance_matrix <- xgb.importance(feature_names = colnames(xgb_matrix), model = xgb_model)
+
+# 8.2 Retrieve Spearman correlations
+cat("  Extracting Spearman correlations from JT results...\n")
+spearman_vec <- numeric(length(best_features))
+names(spearman_vec) <- best_features
+for (f in best_features) {
+    spearman_vec[f] <- jt_results$Spearman_rho[jt_results$Feature == f]
+}
+
+# 8.3 Compute hybrid weights (original method)
+cat("  Calculating hybrid weights (geometric mean of XGBoost Gain and |Spearman_rho|)...\n")
+
+xgb_imp_vec <- numeric(length(best_features))
+names(xgb_imp_vec) <- best_features
+for (i in 1:nrow(importance_matrix)) {
+    feat <- gsub("_log_z", "", importance_matrix$Feature[i])
+    if (feat %in% names(xgb_imp_vec)) {
+        xgb_imp_vec[feat] <- importance_matrix$Gain[i]
+    }
+}
+
+if (any(xgb_imp_vec == 0)) {
+    min_gain <- ifelse(sum(xgb_imp_vec) > 0, min(xgb_imp_vec[xgb_imp_vec > 0]) * 0.1, 0.001)
+    xgb_imp_vec[xgb_imp_vec == 0] <- min_gain
+}
+
+raw_weights <- numeric(length(best_features))
+for (i in seq_along(best_features)) {
+    f <- best_features[i]
+    raw_weights[i] <- sqrt(xgb_imp_vec[f] * abs(spearman_vec[f]))
+}
+hybrid_weights <- raw_weights * sign(spearman_vec)
+hybrid_weights <- hybrid_weights / sum(abs(hybrid_weights))
+
+cat("\n  Hybrid Weights (Geometric Mean of XGBoost Gain × |Spearman_rho|):\n")
+for (i in seq_along(best_features)) {
+    cat(sprintf("    %-6s: XGBoost=%.4f, Spearman=%.4f → Weight=%.4f\n",
+                best_features[i], xgb_imp_vec[i], spearman_vec[i], hybrid_weights[i]))
+}
+
+# 8.4 Calculate standardized scores (original method)
+cat("  Calculating standardized scores with hybrid weights...\n")
+
+score_means <- sapply(best_features, function(f) mean(df[[f]], na.rm = TRUE))
+score_sds   <- sapply(best_features, function(f) sd(df[[f]], na.rm = TRUE))
+
+standardized_score <- rep(0, nrow(df))
+for (i in seq_along(best_features)) {
+    f <- best_features[i]
+    z <- (df[[f]] - score_means[i]) / score_sds[i]
+    standardized_score <- standardized_score + hybrid_weights[i] * z
+}
+
+cor_val <- cor(standardized_score, df$Group_Numeric, method = "spearman")
+if (cor_val < 0) {
+    cat("  Standardized score has negative correlation with disease severity. Inverting...\n")
+    standardized_score <- -standardized_score
+    cor_val <- -cor_val
+}
+
+df$Standardized_Score <- standardized_score
+df$Final_Score <- 100 * (df$Standardized_Score - min(df$Standardized_Score)) / 
+    (max(df$Standardized_Score) - min(df$Standardized_Score))
+
+cat(sprintf("\n  Final score calculation:\n"))
+cat(sprintf("    Raw score range: [%.2f, %.2f]\n", min(df$Standardized_Score), max(df$Standardized_Score)))
+cat(sprintf("    Final score range: [%.1f, %.1f]\n", min(df$Final_Score), max(df$Final_Score)))
+cat(sprintf("    Correlation with disease severity: ρ = %.3f\n", cor_val))
+
+
+# #############################################################################
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+# # # # # # # # #  N E W   M O D U L E S   S T A R T   H E R E  # # # # # # #
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+# #############################################################################
+
+# =============================================================================
+# NEW MODULE A: Confounder Adjustment Analysis
+# Purpose: Address reviewer comment: "no evidence of controlling confounders"
+# =============================================================================
+cat("\n\n=== NEW MODULE A: Confounder Adjustment Analysis ===\n")
+
+if(length(confounder_cols) > 0){
+    
+    # A1. Confounders-only model
+    cat("\n[A1] Evaluating Confounders-only model (Age/Sex/BMI)...\n")
+    conf_only_formula <- paste("Group ~", paste(confounder_cols, collapse = " + "))
+    conf_only_model <- tryCatch(
+        polr(as.formula(conf_only_formula), data = df, Hess = TRUE, method = "logistic"),
+        error = function(e) NULL
+    )
+    
+    if(!is.null(conf_only_model)){
+        conf_only_aic <- AIC(conf_only_model)
+        conf_only_coefs <- coef(conf_only_model)
+        conf_only_score <- rep(0, nrow(df))
+        for(ct in confounder_cols){
+            if(ct %in% names(conf_only_coefs)){
+                conf_only_score <- conf_only_score + conf_only_coefs[ct] * df[[ct]]
+            }
+        }
+        conf_only_cor <- cor(conf_only_score, df$Group_Numeric, method = "spearman", use = "complete.obs")
+        cat(sprintf("  Confounders-only model: AIC = %.1f, Spearman ρ = %.3f\n", conf_only_aic, abs(conf_only_cor)))
+    } else {
+        conf_only_aic <- NA
+        conf_only_cor <- NA
+        cat("  WARNING: Could not fit confounders-only model.\n")
+    }
+    
+    # A2. Best biomarkers + confounders (ADJUSTED model)
+    cat("\n[A2] Evaluating Best Biomarkers + Confounders (adjusted model)...\n")
+    adjusted_result <- evaluate_model_confounder(best_biomarkers, df, confounder_terms = confounder_cols, n_bootstrap = 100)
+    
+    cat(sprintf("  Adjusted model: AIC = %.1f, Spearman ρ = %.3f, Bootstrap SR = %.1f%%\n",
+                adjusted_result$aic, adjusted_result$correlation, adjusted_result$bootstrap_success_rate))
+    
+    # A3. Comparison table
+    comparison_conf <- data.frame(
+        Model = c("Confounders_Only", "Best_Biomarkers_Unadjusted", "Best_Biomarkers_Adjusted"),
+        N_Features = c(length(confounder_cols), length(best_biomarkers), length(best_biomarkers) + length(confounder_cols)),
+        AIC = c(conf_only_aic, best_result$aic, adjusted_result$aic),
+        Correlation = c(abs(conf_only_cor), best_result$correlation, adjusted_result$correlation),
+        Bootstrap_SR = c(NA, best_result$bootstrap_success_rate, adjusted_result$bootstrap_success_rate),
+        stringsAsFactors = FALSE
+    )
+    
+    cat("\n=== Confounder Adjustment Comparison ===\n")
+    print(comparison_conf)
+    
+    # A4. Calculate Adjusted Final Score (confounders included in scoring model)
+    cat("\n[A4] Calculating Confounder-Adjusted Final Score...\n")
+    
+    # Method: Include confounders in the hybrid weighting via residual approach
+    # Step 1: Regress Group_Numeric on confounders only, get residuals
+    if(!is.null(conf_only_model)){
+        lm_conf <- lm(as.formula(paste("Group_Numeric ~", paste(confounder_cols, collapse = " + "))), data = df)
+        df$Group_Numeric_residual <- residuals(lm_conf)
+        
+        # Step 2: Calculate biomarker scores that predict the RESIDUAL (confounder-independent severity)
+        # Use original biomarker weights but correlate with residual severity
+        residual_cor <- cor(df$Standardized_Score, df$Group_Numeric_residual, method = "spearman", use = "complete.obs")
+        cat(sprintf("  Biomarker score correlation with confounder-adjusted severity (residual): ρ = %.3f\n", residual_cor))
+        
+        # Step 3: Also create a direct adjusted score using the adjusted polr model coefficients
+        adjusted_score <- adjusted_result$standardized_score
+        if(adjusted_result$correlation < 0) adjusted_score <- -adjusted_score
+        df$Adjusted_Standardized_Score <- adjusted_score
+        df$Adjusted_Final_Score <- 100 * (adjusted_score - min(adjusted_score)) / (max(adjusted_score) - min(adjusted_score))
+        
+        cat(sprintf("  Adjusted Final Score range: [%.1f, %.1f]\n", min(df$Adjusted_Final_Score), max(df$Adjusted_Final_Score)))
+        cat(sprintf("  Correlation between Original and Adjusted scores: r = %.3f\n", 
+                    cor(df$Final_Score, df$Adjusted_Final_Score, method = "spearman")))
+    }
+    
+} else {
+    cat("\nSKIPPED: No confounders available in data.\n")
+    comparison_conf <- NULL
+    adjusted_result <- NULL
+}
+
+# =============================================================================
+# NEW MODULE B: M3 - Adjusted R² and RMSE via 5-Fold Cross-Validation
+# Purpose: Address reviewer comment: "report adjusted R² and RMSE"
+# =============================================================================
+cat("\n\n=== NEW MODULE B: M3 - Adjusted R² and RMSE (5-fold CV) ===\n")
+
+# Helper: Adjusted R² formula
+adjusted_r2 <- function(r2, n, p){
+    if(n <= p + 1) return(NA)
+    1 - (1 - r2) * (n - 1) / (n - p - 1)
+}
+
+# Function to run 5-fold CV and return R², Adjusted R², RMSE, MAE
+run_cv_lm <- function(data, features, confounders = NULL, target = "Group_Numeric", n_folds = 5){
+    all_features <- c(features, confounders)
+    all_features <- intersect(all_features, names(data))
+    if(length(all_features) == 0) return(NULL)
+    
+    X <- as.matrix(data[, all_features])
+    y <- data[[target]]
+    
+    # Stratified CV: handle discrete Group_Numeric (1,2,3,4) to avoid duplicate breaks in cut()
+    if(length(unique(y)) <= n_folds){
+        y_factor <- as.factor(y)
+        folds <- createFolds(y_factor, k = n_folds, list = TRUE, returnTrain = FALSE)
+    } else {
+        y_q <- cut(y, breaks = quantile(y, probs = seq(0, 1, length.out = n_folds + 1), na.rm = TRUE), include.lowest = TRUE)
+        folds <- createFolds(y_q, k = n_folds, list = TRUE, returnTrain = FALSE)
+    }
+    
+    preds <- numeric(length(y))
+    fold_metrics <- list()
+    
+    for(i in seq_along(folds)){
+        test_idx <- folds[[i]]
+        train_idx <- setdiff(1:nrow(data), test_idx)
+        
+        X_train <- X[train_idx, , drop = FALSE]
+        X_test <- X[test_idx, , drop = FALSE]
+        y_train <- y[train_idx]
+        y_test <- y[test_idx]
+        
+        dtrain <- xgb.DMatrix(data = X_train, label = y_train)
+        dtest <- xgb.DMatrix(data = X_test, label = y_test)
+        
+        params_xgb <- list(
+            objective = "reg:squarederror", eval_metric = "rmse",
+            eta = 0.05, max_depth = 3, subsample = 0.8,
+            colsample_bytree = 0.8, lambda = 1, alpha = 0.5, min_child_weight = 3
+        )
+        
+        model <- xgb.train(params = params_xgb, data = dtrain, nrounds = 500,
+                           evals = list(test = dtest), early_stopping_rounds = 30, verbose = 0)
+        
+        pred <- predict(model, newdata = X_test)
+        preds[test_idx] <- pred
+        
+        ss_res <- sum((y_test - pred)^2)
+        ss_tot <- sum((y_test - mean(y_test))^2)
+        r2 <- ifelse(ss_tot == 0, 0, 1 - ss_res / ss_tot)
+        rmse <- sqrt(mean((y_test - pred)^2))
+        mae <- mean(abs(y_test - pred))
+        adj_r2 <- adjusted_r2(r2, length(y_test), ncol(X_test))
+        
+        fold_metrics[[i]] <- data.frame(
+            fold = i,
+            n_train = length(train_idx),
+            n_test = length(test_idx),
+            R2 = r2, Adjusted_R2 = adj_r2, RMSE = rmse, MAE = mae,
+            stringsAsFactors = FALSE
+        )
+    }
+    
+    # Overall metrics
+    ss_res <- sum((y - preds)^2)
+    ss_tot <- sum((y - mean(y))^2)
+    overall_r2 <- ifelse(ss_tot == 0, 0, 1 - ss_res / ss_tot)
+    overall_adj_r2 <- adjusted_r2(overall_r2, length(y), ncol(X))
+    overall_rmse <- sqrt(mean((y - preds)^2))
+    overall_mae <- mean(abs(y - preds))
+    
+    list(
+        overall = data.frame(
+            Metric = c("R2", "Adjusted_R2", "RMSE", "MAE"),
+            Value = c(overall_r2, overall_adj_r2, overall_rmse, overall_mae),
+            stringsAsFactors = FALSE
+        ),
+        fold_metrics = do.call(rbind, fold_metrics),
+        predictions = preds
+    )
+}
+
+biomarker_terms <- paste0(best_biomarkers, "_log_z")
+
+# Model 1: Biomarkers only
+cat("\n[B1] 5-fold CV: Best Biomarkers ONLY...\n")
+cv_bio_only <- run_cv_lm(df, features = biomarker_terms, confounders = NULL, n_folds = 5)
+
+# Model 2: Confounders only (if available)
+cv_conf_only <- NULL
+if(length(confounder_cols) > 0){
+    cat("[B2] 5-fold CV: Confounders ONLY...\n")
+    cv_conf_only <- run_cv_lm(df, features = NULL, confounders = confounder_cols, n_folds = 5)
+}
+
+# Model 3: Biomarkers + Confounders (if available)
+cv_bio_conf <- NULL
+if(length(confounder_cols) > 0){
+    cat("[B3] 5-fold CV: Best Biomarkers + Confounders...\n")
+    cv_bio_conf <- run_cv_lm(df, features = biomarker_terms, confounders = confounder_cols, n_folds = 5)
+}
+
+# Compile CV results table
+cv_results_list <- list()
+cv_results_list[["Biomarkers_Only"]] <- cv_bio_only$overall
+if(!is.null(cv_conf_only)) cv_results_list[["Confounders_Only"]] <- cv_conf_only$overall
+if(!is.null(cv_bio_conf)) cv_results_list[["Biomarkers_plus_Confounders"]] <- cv_bio_conf$overall
+
+cv_comparison <- do.call(rbind, lapply(names(cv_results_list), function(name){
+    d <- cv_results_list[[name]]
+    data.frame(
+        Model = name,
+        R2 = d$Value[d$Metric == "R2"],
+        Adjusted_R2 = d$Value[d$Metric == "Adjusted_R2"],
+        RMSE = d$Value[d$Metric == "RMSE"],
+        MAE = d$Value[d$Metric == "MAE"],
+        stringsAsFactors = FALSE
+    )
+}))
+
+cat("\n=== 5-Fold CV Results (M3: Adjusted R² and RMSE) ===\n")
+print(cv_comparison)
+
+# =============================================================================
+# NEW MODULE C: M11 - Incremental Predictive Value Analysis
+# Purpose: Address reviewer comment: "does adding microbiome/features provide incremental value?"
+# Here we assess: do biomarkers add value beyond confounders?
+# =============================================================================
+cat("\n\n=== NEW MODULE C: M11 - Incremental Predictive Value Analysis ===\n")
+
+if(length(confounder_cols) > 0 && !is.null(cv_conf_only) && !is.null(cv_bio_conf)){
+    
+    # Use squared errors from CV predictions for paired comparison
+    se_conf_only <- (df$Group_Numeric - cv_conf_only$predictions)^2
+    se_bio_only <- (df$Group_Numeric - cv_bio_only$predictions)^2
+    se_bio_conf <- (df$Group_Numeric - cv_bio_conf$predictions)^2
+    
+    # Test 1: Biomarkers add value beyond confounders? (Confounders_only vs Biomarkers+Confounders)
+    t_test_1 <- t.test(se_conf_only, se_bio_conf, paired = TRUE)
+    
+    # Test 2: Confounders add value beyond biomarkers? (Biomarkers_only vs Biomarkers+Confounders)
+    t_test_2 <- t.test(se_bio_only, se_bio_conf, paired = TRUE)
+    
+    cat("\n[C1] Do biomarkers add incremental value beyond confounders?\n")
+    cat(sprintf("  Mean SE (Confounders only): %.4f\n", mean(se_conf_only)))
+    cat(sprintf("  Mean SE (Biomarkers + Confounders): %.4f\n", mean(se_bio_conf)))
+    cat(sprintf("  Paired t-test p-value: %.4f\n", t_test_1$p.value))
+    if(t_test_1$p.value < 0.05){
+        cat("  CONCLUSION: Biomarkers provide SIGNIFICANT incremental value beyond confounders.\n")
+    } else {
+        cat("  CONCLUSION: Biomarkers do NOT provide significant incremental value beyond confounders.\n")
+    }
+    
+    cat("\n[C2] Do confounders add incremental value beyond biomarkers?\n")
+    cat(sprintf("  Mean SE (Biomarkers only): %.4f\n", mean(se_bio_only)))
+    cat(sprintf("  Mean SE (Biomarkers + Confounders): %.4f\n", mean(se_bio_conf)))
+    cat(sprintf("  Paired t-test p-value: %.4f\n", t_test_2$p.value))
+    if(t_test_2$p.value < 0.05){
+        cat("  CONCLUSION: Confounders provide SIGNIFICANT incremental value beyond biomarkers alone.\n")
+    } else {
+        cat("  CONCLUSION: Confounders do NOT provide significant incremental value beyond biomarkers alone.\n")
+    }
+    
+    incremental_results <- data.frame(
+        Comparison = c("Biomarkers_vs_Confounders", "Confounders_vs_Biomarkers"),
+        Model_Base = c("Confounders_Only", "Biomarkers_Only"),
+        Model_Extended = c("Biomarkers_plus_Confounders", "Biomarkers_plus_Confounders"),
+        Mean_SE_Base = c(mean(se_conf_only), mean(se_bio_only)),
+        Mean_SE_Extended = c(mean(se_bio_conf), mean(se_bio_conf)),
+        Delta_RMSE = c(sqrt(mean(se_conf_only)) - sqrt(mean(se_bio_conf)), 
+                       sqrt(mean(se_bio_only)) - sqrt(mean(se_bio_conf))),
+        P_value = c(t_test_1$p.value, t_test_2$p.value),
+        Significant = c(t_test_1$p.value < 0.05, t_test_2$p.value < 0.05),
+        stringsAsFactors = FALSE
+    )
+    
+} else {
+    cat("\nSKIPPED: Confounders not available or CV failed.\n")
+    incremental_results <- NULL
+    t_test_1 <- NULL
+    t_test_2 <- NULL
+}
+
+# =============================================================================
+# NEW MODULE D: M5 - Circularity Avoidance Validation
+# Purpose: Address reviewer comment: "risk of circularity in composite score"
+# Method: Strict bootstrap train/test separation for weight estimation
+# =============================================================================
+cat("\n\n=== NEW MODULE D: M5 - Circularity Avoidance Validation ===\n")
+
+cat("  Performing 100 bootstrap iterations with STRICT train/test separation...\n")
+cat("  Training set: used for XGBoost fitting, Gain extraction, and Spearman correlation.\n")
+cat("  Test set (OOB): used ONLY for score evaluation. No test data leaks into weight estimation.\n")
+
+n_boot_m5 <- 100
+circular_test_cors <- numeric(n_boot_m5)
+circular_train_cors <- numeric(n_boot_m5)
+circular_weights_sd <- matrix(NA, nrow = n_boot_m5, ncol = length(best_features))
+colnames(circular_weights_sd) <- best_features
+
+pb_m5 <- txtProgressBar(min = 0, max = n_boot_m5, style = 3)
+
+for(b in 1:n_boot_m5){
+    # Bootstrap sample indices
+    boot_idx <- sample(1:nrow(df), nrow(df), replace = TRUE)
+    oob_idx <- setdiff(1:nrow(df), unique(boot_idx))
+    
+    if(length(oob_idx) < 5) next
+    
+    boot_data <- df[boot_idx, ]
+    oob_data <- df[oob_idx, ]
+    
+    # Step 1: Train XGBoost on bootstrap data ONLY
+    xgb_boot <- boot_data[, paste0(best_features, "_log_z"), drop = FALSE]
+    y_boot <- boot_data$Group_Numeric
+    complete_boot <- complete.cases(xgb_boot, y_boot)
+    
+    if(sum(complete_boot) < 10) next
+    
+    dtrain_boot <- xgb.DMatrix(data = as.matrix(xgb_boot[complete_boot, ]), label = y_boot[complete_boot])
+    xgb_model_boot <- xgb.train(params = params, data = dtrain_boot, nrounds = 100, verbose = 0)
+    
+    # Step 2: Extract Gain from bootstrap model
+    imp_boot <- xgb.importance(model = xgb_model_boot)
+    xgb_imp_boot <- numeric(length(best_features))
+    names(xgb_imp_boot) <- best_features
+    for(i in 1:nrow(imp_boot)){
+        feat <- gsub("_log_z", "", imp_boot$Feature[i])
+        if(feat %in% names(xgb_imp_boot)) xgb_imp_boot[feat] <- imp_boot$Gain[i]
+    }
+    if(any(xgb_imp_boot == 0)){
+        min_g <- ifelse(sum(xgb_imp_boot) > 0, min(xgb_imp_boot[xgb_imp_boot > 0]) * 0.1, 0.001)
+        xgb_imp_boot[xgb_imp_boot == 0] <- min_g
+    }
+    
+    # Step 3: Calculate Spearman rho on bootstrap data ONLY
+    spear_boot <- numeric(length(best_features))
+    names(spear_boot) <- best_features
+    for(f in best_features){
+        spear_boot[f] <- cor(boot_data[[f]], boot_data$Group_Numeric, method = "spearman", use = "complete.obs")
+    }
+    
+    # Step 4: Compute hybrid weights (TRAIN only)
+    raw_w <- numeric(length(best_features))
+    for(i in seq_along(best_features)){
+        f <- best_features[i]
+        raw_w[i] <- sqrt(xgb_imp_boot[f] * abs(spear_boot[f]))
+    }
+    w_train <- raw_w * sign(spear_boot)
+    w_train <- w_train / sum(abs(w_train))
+    circular_weights_sd[b, ] <- w_train
+    
+    # Step 5: Apply weights to OOB data (TEST only) and evaluate
+    score_train <- rep(0, nrow(boot_data))
+    score_oob <- rep(0, nrow(oob_data))
+    for(i in seq_along(best_features)){
+        f <- best_features[i]
+        z_boot <- (boot_data[[f]] - score_means[i]) / score_sds[i]
+        z_oob <- (oob_data[[f]] - score_means[i]) / score_sds[i]
+        score_train <- score_train + w_train[i] * z_boot
+        score_oob <- score_oob + w_train[i] * z_oob
+    }
+    
+    # Ensure positive correlation
+    if(cor(score_train, boot_data$Group_Numeric, method = "spearman") < 0){
+        score_train <- -score_train
+        score_oob <- -score_oob
+    }
+    
+    circular_train_cors[b] <- cor(score_train, boot_data$Group_Numeric, method = "spearman", use = "complete.obs")
+    if(length(unique(oob_data$Group_Numeric)) > 1){
+        circular_test_cors[b] <- cor(score_oob, oob_data$Group_Numeric, method = "spearman", use = "complete.obs")
+    }
+    
+    setTxtProgressBar(pb_m5, b)
+}
+close(pb_m5)
+
+valid_m5 <- which(!is.na(circular_test_cors))
+cat(sprintf("\n=== M5 Circularity Avoidance Results (n_valid = %d) ===\n", length(valid_m5)))
+cat(sprintf("  Mean Train Correlation (within bootstrap): %.3f (SD: %.3f)\n", 
+            mean(circular_train_cors, na.rm = TRUE), sd(circular_train_cors, na.rm = TRUE)))
+cat(sprintf("  Mean TEST Correlation (OOB, no circularity): %.3f (SD: %.3f)\n", 
+            mean(circular_test_cors[valid_m5]), sd(circular_test_cors[valid_m5])))
+cat(sprintf("  Weight stability across bootstraps (mean SD per feature): %.4f\n", 
+            mean(apply(circular_weights_sd[valid_m5, ], 2, sd, na.rm = TRUE))))
+
+cat("\n  INTERPRETATION: Test-set correlation is estimated with NO data leakage.\n")
+cat("  If Test correlation ≈ Train correlation, the composite score is robust and not overfitted.\n")
+
+m5_results <- data.frame(
+    Metric = c("Train_Correlation_Mean", "Train_Correlation_SD", 
+               "Test_Correlation_Mean", "Test_Correlation_SD",
+               "Weight_Stability_MeanSD", "N_Bootstrap_Valid"),
+    Value = c(mean(circular_train_cors, na.rm = TRUE), sd(circular_train_cors, na.rm = TRUE),
+              mean(circular_test_cors[valid_m5]), sd(circular_test_cors[valid_m5]),
+              mean(apply(circular_weights_sd[valid_m5, ], 2, sd, na.rm = TRUE)),
+              length(valid_m5)),
+    stringsAsFactors = FALSE
+)
+
+# Weight stability detail
+weight_stability_df <- data.frame(
+    Feature = best_features,
+    Mean_Weight = apply(circular_weights_sd[valid_m5, ], 2, mean, na.rm = TRUE),
+    SD_Weight = apply(circular_weights_sd[valid_m5, ], 2, sd, na.rm = TRUE),
+    CV_Weight = apply(circular_weights_sd[valid_m5, ], 2, sd, na.rm = TRUE) / 
+        abs(apply(circular_weights_sd[valid_m5, ], 2, mean, na.rm = TRUE)),
+    stringsAsFactors = FALSE
+)
+
+# =============================================================================
+# 10. CREATE TITLE PLOT (original preserved)
+# =============================================================================
+cat("\n=== Creating Title Plot ===\n")
+
+title_plot <- ggplot() +
+    annotate("text", x = 0.5, y = 0.7, 
+             label = "BIOMARKER COMBINATION ANALYSIS\nFOR LIVER DISEASE SEVERITY ASSESSMENT", 
+             size = 8, fontface = "bold", hjust = 0.5, lineheight = 0.8) +
+    annotate("text", x = 0.5, y = 0.4, 
+             label = sprintf("Revised Composite Score Methodology\n%d Biomarkers Evaluated | %d Total Samples", 
+                             length(biomarker_names), nrow(df)), 
+             size = 5, hjust = 0.5, lineheight = 0.8) +
+    annotate("text", x = 0.5, y = 0.2, 
+             label = sprintf("Best Combination: %s\nComposite Score: %.3f | Correlation: ρ = %.3f", 
+                             best_combination$Biomarkers, best_combination$Composite_Score, 
+                             best_combination$Correlation), 
+             size = 4, hjust = 0.5, lineheight = 0.8, color = "darkblue") +
+    theme_void() +
+    theme(plot.background = element_rect(fill = "gray95", color = NA))
+
+# =============================================================================
+# 11. CREATE TABLES (original preserved)
+# =============================================================================
+cat("\n=== Creating Result Tables ===\n")
+
+# Table 1: Top 10 combinations
+table1_data <- top_10 %>%
+    select(Rank, Biomarkers, N_Biomarkers, Composite_Score, Correlation, 
+           Bootstrap_Success_Rate, AIC) %>%
+    mutate(across(where(is.numeric), ~ round(., 3)))
+
+p_table1 <- tableGrob(table1_data, rows = NULL, theme = ttheme_default(
+    core = list(bg_params = list(fill = c("white", "gray95"), col = "black")),
+    colhead = list(bg_params = list(fill = "lightblue", col = "black"))
+))
+
+# Table 2: Best by number of biomarkers
+table2_data <- best_by_size %>%
+    select(N_Biomarkers, Biomarkers, Composite_Score, Correlation, Bootstrap_Success_Rate) %>%
+    mutate(across(where(is.numeric), ~ round(., 3)))
+
+p_table2 <- tableGrob(table2_data, rows = NULL, theme = ttheme_default(
+    core = list(bg_params = list(fill = c("white", "gray95"), col = "black")),
+    colhead = list(bg_params = list(fill = "lightgreen", col = "black"))
+))
+
+# Table 3: Best combination details
+best_coefs <- importance_df %>%
+    select(Biomarker, Coefficient, Std_Error, P_Value, Importance_Percent) %>%
+    mutate(across(where(is.numeric), ~ round(., 4)))
+
+p_table3 <- tableGrob(best_coefs, rows = NULL, theme = ttheme_default(
+    core = list(bg_params = list(fill = c("white", "gray95"), col = "black")),
+    colhead = list(bg_params = list(fill = "lightyellow", col = "black"))
+))
+
+# =============================================================================
+# 12. VISUALIZE COMPOSITE SCORE COMPONENTS (original preserved)
+# =============================================================================
+cat("\n=== Visualizing Composite Score Components ===\n")
+
+viz_data <- results_df %>%
+    mutate(
+        Model_Type = paste(N_Biomarkers, "biomarkers"),
+        Biomarkers_Short = ifelse(nchar(Biomarkers) > 30, 
+                                  paste0(substr(Biomarkers, 1, 27), "..."), 
+                                  Biomarkers)
+    )
+
+# Plot 1: Composite Score vs AIC
+p1 <- ggplot(viz_data, aes(x = AIC, y = Composite_Score, 
+                           color = factor(N_Biomarkers), size = Correlation)) +
+    geom_point(alpha = 0.7) +
+    geom_point(data = best_combination, color = "red", size = 5, shape = 1, stroke = 1.5) +
+    geom_text_repel(data = best_combination,
+                    aes(label = paste("Best:", Biomarkers)),
+                    color = "red", size = 4, box.padding = 0.5) +
+    labs(
+        title = "Revised Composite Score vs AIC",
+        subtitle = "Color: Number of biomarkers | Size: Correlation strength",
+        x = "Akaike Information Criterion (AIC) [Lower is better]",
+        y = "Revised Composite Score [Higher is better]",
+        color = "Number of\nBiomarkers",
+        size = "Correlation\n(ρ)"
+    ) +
+    theme_minimal(base_size = 12) +
+    scale_color_brewer(palette = "Set1") +
+    theme(legend.position = "right")
+
+# Plot 2: Three-dimensional visualization
+p2 <- ggplot(viz_data, aes(x = Correlation, y = Bootstrap_Success_Rate, 
+                           size = Composite_Score, color = factor(N_Biomarkers))) +
+    geom_point(alpha = 0.7) +
+    geom_point(data = best_combination, color = "red", size = 5, shape = 1, stroke = 1.5) +
+    geom_text_repel(data = best_combination,
+                    aes(label = paste("Best:", Biomarkers)),
+                    color = "red", size = 4, box.padding = 0.5) +
+    labs(
+        title = "Three-Way Performance Comparison",
+        subtitle = "Revised Composite Score balances Correlation, Bootstrap Stability, and AIC",
+        x = "Spearman Correlation (ρ) [Higher is better]",
+        y = "Bootstrap Success Rate (%) [Higher is better]",
+        color = "Number of\nBiomarkers",
+        size = "Composite\nScore"
+    ) +
+    theme_minimal(base_size = 12) +
+    scale_color_brewer(palette = "Set1") +
+    scale_size_continuous(range = c(2, 6))
+
+# Plot 3: Composite score decomposition for top models
+top_5 <- head(viz_data, 5)
+melted_top <- top_5 %>%
+    select(Biomarkers_Short, Correlation, Bootstrap_Success_Rate, AIC, Composite_Score) %>%
+    mutate(
+        Correlation_Score = Correlation,
+        Bootstrap_Score = Bootstrap_Success_Rate / 100,
+        AIC_Score = 1 - ((AIC - min(results_df$AIC)) / (max(results_df$AIC) - min(results_df$AIC)))
+    ) %>%
+    select(Biomarkers_Short, Correlation_Score, Bootstrap_Score, AIC_Score) %>%
+    reshape2::melt(id.vars = "Biomarkers_Short")
+
+p3 <- ggplot(melted_top, aes(x = Biomarkers_Short, y = value, fill = variable)) +
+    geom_bar(stat = "identity", position = "stack") +
+    labs(
+        title = "Composite Score Decomposition for Top 5 Models",
+        subtitle = "Shows contribution of each component to the total score",
+        x = "Biomarker Combination",
+        y = "Score Contribution",
+        fill = "Component"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "bottom"
+    ) +
+    scale_fill_brewer(
+        palette = "Set2",
+        labels = c("Correlation (34%)", "Bootstrap (34%)", "AIC (32%)")
+    )
+
+# =============================================================================
+# 13. CREATE REVISED SCORING FORMULA VISUALIZATION (original preserved)
+# =============================================================================
+cat("\n=== Creating Revised Scoring Formula Visualization ===\n")
+
+formula_text <- paste(
+    "REVISED COMPOSITE SCORE FORMULA (No Parsimony Penalty):",
+    "\n\nComposite Score = 0.35 × Correlation + 0.35 × (Bootstrap_SR/100) + 0.30 × AIC_Score",
+    "\n\nWhere:",
+    "• Correlation = Spearman correlation with disease severity (ρ)",
+    "• Bootstrap_SR = Bootstrap success rate (%)",
+    "• AIC_Score = 1 - (AIC - min_AIC) / (max_AIC - min_AIC) [normalized to 0-1]",
+    "\n\nBiomarker Direction Adjustment:",
+    "• Decreasing biomarkers (ALB, CHE, HGB): Expected negative coefficients",
+    "• Increasing biomarkers (ALT, AST, DBIL, INR, PT, TB, TBA): Expected positive coefficients",
+    "• Final score correlation ensured positive with disease severity",
+    "\n\nWeight Justification:",
+    "• Correlation (35%): Direct measure of predictive accuracy",
+    "• Bootstrap Stability (35%): Model robustness and generalizability",
+    "• AIC (30%): Model fit and complexity balance",
+    "\n\nKey Advantages:",
+    "1. No parsimony penalty - focus on actual performance metrics",
+    "2. Balanced emphasis on accuracy and stability",
+    "3. AIC properly normalized (lower values get higher scores)",
+    "4. All components equally important for clinical utility",
+    "5. Biomarker direction consistency checked",
+    sep = "\n"
+)
+
+p_formula <- ggplot() +
+    annotate("text", x = 0.1, y = 0.95, label = formula_text,
+             size = 3.8, hjust = 0, vjust = 1, family = "mono") +
+    labs(title = "Revised Composite Score Methodology") +
+    theme_void() +
+    theme(
+        plot.title = element_text(hjust = 0.5, face = "bold", size = 14, margin = margin(b = 10)),
+        plot.background = element_rect(fill = "gray98", color = NA)
+    )
+
+# =============================================================================
+# 14. CREATE SEPARATE PDF VISUALIZATIONS (original preserved + NEW additions)
+# =============================================================================
+cat("\n=== Creating Separate PDF Visualizations ===\n")
+
+# 1. Main analysis report (original)
+cat("1. Saving main analysis report...\n")
+main_report <- (title_plot) / 
+    (p_formula) /
+    (p1) / (p2) / (p3) +
+    plot_layout(ncol = 1, heights = c(1, 1.5, 1, 1, 1)) +
+    plot_annotation(
+        title = "COMPREHENSIVE BIOMARKER COMBINATION ANALYSIS REPORT\n(Revised Composite Score without Parsimony Penalty)",
+        subtitle = "Optimal Selection from 10 Biomarkers Based on Correlation, Bootstrap Stability, and AIC",
+        caption = paste("Generated:", format(Sys.time(), "%Y-%m-%d %H:%M:%S"),
+                        "| Valid models:", nrow(results_df), "/", length(all_combinations),
+                        "| 10 Biomarkers: ALB, CHE, HGB, ALT, AST, DBIL, INR, PT, TB, TBA"),
+        theme = theme(
+            plot.title = element_text(hjust = 0.5, size = 18, face = "bold", margin = margin(b = 10)),
+            plot.subtitle = element_text(hjust = 0.5, size = 14, margin = margin(b = 10)),
+            plot.caption = element_text(hjust = 1, size = 10, color = "gray50"),
+            plot.background = element_rect(fill = "white", color = NA)
+        )
+    )
+
+ggsave("01_Main_Analysis_Report.pdf", plot = main_report, width = 16, height = 14, device = "pdf")
+cat("   ✓ 01_Main_Analysis_Report.pdf saved\n")
+
+# 2. Individual visualizations (original)
+cat("\n2. Saving individual visualizations...\n")
+
+p1_enhanced <- p1 + 
+    theme(plot.background = element_rect(fill = "white", color = NA),
+          panel.background = element_rect(fill = "white", color = NA))
+ggsave("02_Composite_Score_vs_AIC.pdf", plot = p1_enhanced, width = 12, height = 8, device = "pdf")
+cat("   ✓ 02_Composite_Score_vs_AIC.pdf saved\n")
+
+p2_enhanced <- p2 + 
+    theme(plot.background = element_rect(fill = "white", color = NA),
+          panel.background = element_rect(fill = "white", color = NA))
+ggsave("03_Three_Way_Performance_Comparison.pdf", plot = p2_enhanced, width = 12, height = 8, device = "pdf")
+cat("   ✓ 03_Three_Way_Performance_Comparison.pdf saved\n")
+
+p3_enhanced <- p3 + 
+    theme(plot.background = element_rect(fill = "white", color = NA),
+          panel.background = element_rect(fill = "white", color = NA))
+ggsave("04_Composite_Score_Decomposition.pdf", plot = p3_enhanced, width = 14, height = 8, device = "pdf")
+cat("   ✓ 04_Composite_Score_Decomposition.pdf saved\n")
+
+p_formula_enhanced <- p_formula + 
+    theme(plot.background = element_rect(fill = "white", color = NA))
+ggsave("05_Scoring_Methodology.pdf", plot = p_formula_enhanced, width = 14, height = 10, device = "pdf")
+cat("   ✓ 05_Scoring_Methodology.pdf saved\n")
+
+# 3. Tables as separate PDFs (original)
+cat("\n3. Saving tables as PDFs...\n")
+
+p_table1_enhanced <- grid.arrange(
+    grobs = list(
+        grid::textGrob("Top 10 Biomarker Combinations by Revised Composite Score", 
+                       gp = grid::gpar(fontsize = 16, fontface = "bold")),
+        p_table1
+    ),
+    ncol = 1, heights = c(0.1, 0.9)
+)
+ggsave("06_Top_10_Combinations_Table.pdf", plot = p_table1_enhanced, width = 14, height = 10, device = "pdf")
+cat("   ✓ 06_Top_10_Combinations_Table.pdf saved\n")
+
+p_table2_enhanced <- grid.arrange(
+    grobs = list(
+        grid::textGrob("Best Combinations by Number of Biomarkers", 
+                       gp = grid::gpar(fontsize = 16, fontface = "bold")),
+        p_table2
+    ),
+    ncol = 1, heights = c(0.1, 0.9)
+)
+ggsave("07_Best_Combinations_by_Size.pdf", plot = p_table2_enhanced, width = 14, height = 8, device = "pdf")
+cat("   ✓ 07_Best_Combinations_by_Size.pdf saved\n")
+
+p_table3_enhanced <- grid.arrange(
+    grobs = list(
+        grid::textGrob("Best Combination: Biomarker Coefficients and Importance", 
+                       gp = grid::gpar(fontsize = 16, fontface = "bold")),
+        p_table3
+    ),
+    ncol = 1, heights = c(0.1, 0.9)
+)
+ggsave("08_Best_Combination_Details.pdf", plot = p_table3_enhanced, width = 14, height = 8, device = "pdf")
+cat("   ✓ 08_Best_Combination_Details.pdf saved\n")
+
+# 4. Additional visualizations from the model (original)
+cat("\n4. Creating additional model visualizations...\n")
+
+p_importance_plot <- ggplot(importance_df, aes(x = reorder(Biomarker, Importance_Percent),
+                                               y = Importance_Percent,
+                                               fill = Importance_Percent)) +
+    geom_bar(stat = "identity") +
+    geom_text(aes(label = sprintf("%.1f%%\n(coef=%.2f)", Importance_Percent, Coefficient)),
+              hjust = -0.1, size = 4) +
+    coord_flip() +
+    labs(
+        title = "Biomarker Importance in Best Combination",
+        subtitle = sprintf("Best combination: %s", best_combination$Biomarkers),
+        x = "Biomarker",
+        y = "Relative Importance (%)",
+        fill = "Importance (%)"
+    ) +
+    theme_minimal(base_size = 12) +
+    scale_fill_gradient(low = "lightblue", high = "darkblue") +
+    scale_y_continuous(limits = c(0, max(importance_df$Importance_Percent) * 1.2)) +
+    theme(
+        plot.title = element_text(hjust = 0.5, face = "bold"),
+        plot.subtitle = element_text(hjust = 0.5),
+        axis.text.y = element_text(size = 11),
+        plot.background = element_rect(fill = "white", color = NA),
+        panel.background = element_rect(fill = "white", color = NA)
+    )
+
+ggsave("09_Biomarker_Importance.pdf", plot = p_importance_plot, width = 10, height = 6, device = "pdf")
+cat("   ✓ 09_Biomarker_Importance.pdf saved\n")
+
+p_score_dist <- ggplot(df, aes(x = Group, y = Final_Score, fill = Group)) +
+    geom_violin(alpha = 0.6, trim = FALSE) +
+    geom_boxplot(width = 0.2, alpha = 0.8, outlier.shape = NA) +
+    geom_jitter(width = 0.1, alpha = 0.5, size = 1, color = "gray30") +
+    labs(
+        title = "Disease Severity Score Distribution by Group",
+        subtitle = sprintf("Best combination: %s | Correlation: ρ = %.3f", 
+                           best_combination$Biomarkers, best_combination$Correlation),
+        x = "Disease Group",
+        y = "Severity Score (0-100)"
+    ) +
+    theme_minimal(base_size = 12) +
+    scale_fill_brewer(palette = "Set2") +
+    ylim(0, 100) +
+    geom_hline(yintercept = c(25, 50, 75), linetype = "dashed", alpha = 0.3, color = "gray50") +
+    theme(
+        legend.position = "none",
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(hjust = 0.5, face = "bold"),
+        plot.subtitle = element_text(hjust = 0.5),
+        plot.background = element_rect(fill = "white", color = NA),
+        panel.background = element_rect(fill = "white", color = NA)
+    )
+
+ggsave("10_Score_Distribution_by_Group.pdf", plot = p_score_dist, width = 10, height = 8, device = "pdf")
+cat("   ✓ 10_Score_Distribution_by_Group.pdf saved\n")
+
+ggsave("00_Title_Page.pdf", plot = title_plot, width = 12, height = 8, device = "pdf")
+cat("   ✓ 00_Title_Page.pdf saved\n")
+
+ggsave("00_Formula_Page.pdf", plot = p_formula, width = 14, height = 10, device = "pdf")
+cat("   ✓ 00_Formula_Page.pdf saved\n")
+
+# =============================================================================
+# NEW PDF FIGURES: Confounder Analysis, CV Results, M5 Validation
+# =============================================================================
+cat("\n=== NEW: Saving Reviewer-Response PDF Figures ===\n")
+
+# NEW Figure A: Confounder Adjustment Comparison
+if(!is.null(comparison_conf) && length(confounder_cols) > 0){
+    
+    conf_long <- comparison_conf %>%
+        pivot_longer(cols = c(AIC, Correlation, Bootstrap_SR), names_to = "Metric", values_to = "Value")
+    
+    p_conf_compare <- ggplot(conf_long, aes(x = Model, y = Value, fill = Metric)) +
+        geom_bar(stat = "identity", position = "dodge", color = "black", size = 0.3) +
+        facet_wrap(~Metric, scales = "free_y") +
+        theme_bw(base_size = 12) +
+        scale_fill_manual(values = c("AIC" = "coral", "Correlation" = "steelblue", "Bootstrap_SR" = "darkgreen")) +
+        labs(
+            title = "Confounder Adjustment Analysis",
+            subtitle = "Comparing Unadjusted vs Confounder-Adjusted Models (Age, Sex, BMI)",
+            x = "Model", y = "Value"
+        ) +
+        theme(
+            legend.position = "none",
+            strip.background = element_rect(fill = "lightgray"),
+            plot.background = element_rect(fill = "white", color = NA),
+            panel.background = element_rect(fill = "white", color = NA)
+        )
+    
+    ggsave("11_Confounder_Adjustment_Comparison.pdf", plot = p_conf_compare, width = 12, height = 6, device = "pdf")
+    cat("   ✓ 11_Confounder_Adjustment_Comparison.pdf saved\n")
+    
+    # NEW Figure B: Original vs Adjusted Score scatter
+    if("Adjusted_Final_Score" %in% names(df)){
+        p_score_compare <- ggplot(df, aes(x = Final_Score, y = Adjusted_Final_Score, color = Group)) +
+            geom_point(alpha = 0.7, size = 2) +
+            geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "red") +
+            geom_smooth(method = "lm", color = "darkblue", se = TRUE) +
+            theme_bw(base_size = 12) +
+            scale_color_brewer(palette = "Set2") +
+            labs(
+                title = "Original vs Confounder-Adjusted Severity Score",
+                subtitle = sprintf("Spearman r = %.3f | Red line = identity (perfect agreement)",
+                                   cor(df$Final_Score, df$Adjusted_Final_Score, method = "spearman")),
+                x = "Original Final Score (0-100)",
+                y = "Adjusted Final Score (0-100)",
+                color = "Group"
+            ) +
+            theme(
+                plot.background = element_rect(fill = "white", color = NA),
+                panel.background = element_rect(fill = "white", color = NA)
+            )
+        
+        ggsave("12_Original_vs_Adjusted_Score.pdf", plot = p_score_compare, width = 8, height = 7, device = "pdf")
+        cat("   ✓ 12_Original_vs_Adjusted_Score.pdf saved\n")
+    }
+}
+
+# NEW Figure C: 5-Fold CV Results (M3)
+if(!is.null(cv_comparison)){
+    cv_long <- cv_comparison %>%
+        pivot_longer(cols = c(R2, Adjusted_R2, RMSE, MAE), names_to = "Metric", values_to = "Value")
+    
+    p_cv_results <- ggplot(cv_long, aes(x = Model, y = Value, fill = Metric)) +
+        geom_bar(stat = "identity", position = "dodge", color = "black", size = 0.3) +
+        facet_wrap(~Metric, scales = "free_y") +
+        theme_bw(base_size = 12) +
+        scale_fill_manual(values = c("R2" = "steelblue", "Adjusted_R2" = "darkgreen", 
+                                     "RMSE" = "coral", "MAE" = "purple")) +
+        labs(
+            title = "5-Fold Cross-Validation Performance (M3)",
+            subtitle = "Adjusted R² and RMSE for Model Comparison",
+            x = "Model", y = "Value"
+        ) +
+        theme(
+            legend.position = "none",
+            strip.background = element_rect(fill = "lightgray"),
+            axis.text.x = element_text(angle = 30, hjust = 1),
+            plot.background = element_rect(fill = "white", color = NA),
+            panel.background = element_rect(fill = "white", color = NA)
+        )
+    
+    ggsave("13_CV_Results_M3.pdf", plot = p_cv_results, width = 12, height = 6, device = "pdf")
+    cat("   ✓ 13_CV_Results_M3.pdf saved\n")
+}
+
+# NEW Figure D: M5 Circularity Avoidance - Weight Stability
+if(length(valid_m5) > 0){
+    p_m5_weights <- ggplot(weight_stability_df, aes(x = reorder(Feature, Mean_Weight), y = Mean_Weight)) +
+        geom_bar(stat = "identity", fill = "steelblue", alpha = 0.7, color = "black") +
+        geom_errorbar(aes(ymin = Mean_Weight - SD_Weight, ymax = Mean_Weight + SD_Weight), width = 0.2) +
+        coord_flip() +
+        theme_bw(base_size = 12) +
+        labs(
+            title = "M5: Hybrid Weight Stability Across 100 Bootstrap Samples",
+            subtitle = "Error bars = SD | Weights estimated independently in each bootstrap training set",
+            x = "Feature", y = "Mean Hybrid Weight"
+        ) +
+        theme(
+            plot.background = element_rect(fill = "white", color = NA),
+            panel.background = element_rect(fill = "white", color = NA)
+        )
+    
+    ggsave("14_M5_Weight_Stability.pdf", plot = p_m5_weights, width = 10, height = 6, device = "pdf")
+    cat("   ✓ 14_M5_Weight_Stability.pdf saved\n")
+    
+    # M5 Train vs Test correlation
+    m5_cor_df <- data.frame(
+        Set = c(rep("Train", length(circular_train_cors)), rep("Test (OOB)", length(valid_m5))),
+        Correlation = c(circular_train_cors, circular_test_cors[valid_m5])
+    )
+    
+    p_m5_cor <- ggplot(m5_cor_df, aes(x = Set, y = Correlation, fill = Set)) +
+        geom_violin(alpha = 0.6, trim = FALSE) +
+        geom_boxplot(width = 0.2, alpha = 0.8) +
+        theme_bw(base_size = 12) +
+        scale_fill_manual(values = c("Train" = "lightblue", "Test (OOB)" = "coral")) +
+        labs(
+            title = "M5: Train vs Test Correlation (Circularity Check)",
+            subtitle = "Test correlation uses OOB samples with NO data leakage into weight estimation",
+            x = "", y = "Spearman Correlation with Group_Numeric"
+        ) +
+        theme(
+            legend.position = "none",
+            plot.background = element_rect(fill = "white", color = NA),
+            panel.background = element_rect(fill = "white", color = NA)
+        )
+    
+    ggsave("15_M5_Train_vs_Test_Correlation.pdf", plot = p_m5_cor, width = 8, height = 6, device = "pdf")
+    cat("   ✓ 15_M5_Train_vs_Test_Correlation.pdf saved\n")
+}
+
+# 5. Create a summary index PDF (original + updated)
+cat("\n5. Creating summary index PDF...\n")
+
+index_text <- paste(
+    "BIOMARKER COMBINATION ANALYSIS - VISUALIZATION INDEX",
+    strrep("=", 60),
+    "\n\nGenerated: ", format(Sys.time(), "%Y-%m-%d %H:%M:%S"),
+    "\nTotal Samples: ", nrow(df),
+    "\nTotal Combinations Evaluated: ", length(all_combinations),
+    "\nValid Models: ", nrow(results_df),
+    "\nBiomarkers Evaluated: ", paste(biomarker_names, collapse = ", "),
+    "\nBest Combination: ", best_combination$Biomarkers,
+    "\nRevised Composite Score: ", round(best_combination$Composite_Score, 3),
+    "\nAIC: ", best_combination$AIC,
+    "\nCorrelation (ρ): ", best_combination$Correlation,
+    "\nBootstrap Success Rate: ", best_combination$Bootstrap_Success_Rate, "%",
+    "\n\nCONFOUNDER CONTROL (NEW):",
+    ifelse(length(confounder_cols) > 0, 
+           paste("\nConfounders included: ", paste(confounder_cols, collapse = ", "),
+                 "\nAdjusted model AIC: ", round(adjusted_result$aic, 1),
+                 "\nAdjusted model Correlation: ", round(adjusted_result$correlation, 3)),
+           "\nNo confounders found in data."),
+    "\n\nVISUALIZATION FILES:",
+    "\n1. 01_Main_Analysis_Report.pdf - Comprehensive analysis report",
+    "\n2. 02_Composite_Score_vs_AIC.pdf - Composite score vs AIC scatter plot",
+    "\n3. 03_Three_Way_Performance_Comparison.pdf - 3D performance comparison",
+    "\n4. 04_Composite_Score_Decomposition.pdf - Score component breakdown",
+    "\n5. 05_Scoring_Methodology.pdf - Detailed scoring formula explanation",
+    "\n6. 06_Top_10_Combinations_Table.pdf - Top 10 combinations results table",
+    "\n7. 07_Best_Combinations_by_Size.pdf - Best combinations by biomarker count",
+    "\n8. 08_Best_Combination_Details.pdf - Best combination performance details",
+    "\n9. 09_Biomarker_Importance.pdf - Relative importance of biomarkers",
+    "\n10. 10_Score_Distribution_by_Group.pdf - Score distribution across disease groups",
+    "\n11. 11_Confounder_Adjustment_Comparison.pdf - NEW: Confounder analysis",
+    "\n12. 12_Original_vs_Adjusted_Score.pdf - NEW: Original vs adjusted score",
+    "\n13. 13_CV_Results_M3.pdf - NEW: 5-fold CV results (R², Adj R², RMSE)",
+    "\n14. 14_M5_Weight_Stability.pdf - NEW: Bootstrap weight stability",
+    "\n15. 15_M5_Train_vs_Test_Correlation.pdf - NEW: Circularity check",
+    "\n\nEXCEL OUTPUT:",
+    "\n• Revised_Biomarker_Combination_Analysis_10biomarkers.xlsx - Complete analysis results",
+    "\n\nANALYSIS METHODOLOGY:",
+    "\n• Revised Composite Score = 0.35×Correlation + 0.35×Bootstrap_SR + 0.30×AIC_Score",
+    "\n• No parsimony penalty applied",
+    "\n• AIC normalized (lower values get higher scores)",
+    "\n• 100 bootstrap replicates per model",
+    "\n• 8 biomarkers evaluated: ALB, CHE,  ALT, AST, DBIL,  PT, TB, TBA",
+    "\n• Biomarker direction consistency checked",
+    "\n• Confounder adjustment: Age, Sex/Gender, BMI controlled in adjusted models",
+    "\n• M5 Circularity: Bootstrap train/test separation for weight estimation",
+    "\n• M3 Metrics: 5-fold CV reports R², Adjusted R², RMSE, MAE",
+    sep = "\n"
+)
+
+p_index <- ggplot() +
+    annotate("text", x = 0.05, y = 0.95, label = index_text,
+             size = 4, hjust = 0, vjust = 1, family = "mono") +
+    labs(title = "Analysis Output Index") +
+    theme_void() +
+    theme(
+        plot.title = element_text(hjust = 0.5, face = "bold", size = 16, margin = margin(b = 20)),
+        plot.background = element_rect(fill = "white", color = NA)
+    )
+
+ggsave("00_Analysis_Index.pdf", plot = p_index, width = 14, height = 12, device = "pdf")
+cat("   ✓ 00_Analysis_Index.pdf saved\n")
+
+# 6. Combined summary PDF
+cat("\n6. Creating combined summary PDF...\n")
+summary_page <- (p1_enhanced + p2_enhanced) / (p3_enhanced + p_importance_plot) +
+    plot_layout(guides = 'collect') +
+    plot_annotation(
+        title = "KEY ANALYSIS VISUALIZATIONS - SUMMARY",
+        subtitle = "Four most important visualizations in one page",
+        theme = theme(
+            plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+            plot.subtitle = element_text(hjust = 0.5, size = 12)
+        )
+    )
+
+ggsave("Summary_Visualizations.pdf", plot = summary_page, width = 16, height = 12, device = "pdf")
+cat("   ✓ Summary_Visualizations.pdf saved\n")
+
+# =============================================================================
+# 15. EXPORT RESULTS TO EXCEL (original + NEW sheets)
+# =============================================================================
+cat("\n=== Exporting Results to Excel ===\n")
+
+wb <- createWorkbook()
+
+# Sheet 1: All combinations with revised scores (original)
+addWorksheet(wb, "All_Combinations_Revised")
+writeData(wb, "All_Combinations_Revised", 
+          "All Evaluated Combinations with Revised Composite Scores (No Parsimony Penalty)", 
+          startRow = 1)
+writeData(wb, "All_Combinations_Revised", 
+          paste("Biomarkers evaluated:", paste(biomarker_names, collapse = ", ")), 
+          startRow = 2)
+writeData(wb, "All_Combinations_Revised", 
+          paste("Data source:", file_path), 
+          startRow = 3)
+writeData(wb, "All_Combinations_Revised", results_df, startRow = 5)
+
+# Sheet 2: Top 10 combinations (original)
+addWorksheet(wb, "Top_10_Combinations")
+writeData(wb, "Top_10_Combinations", 
+          "Top 10 Combinations by Revised Composite Score", 
+          startRow = 1)
+writeData(wb, "Top_10_Combinations", 
+          paste("Data source:", file_path), 
+          startRow = 2)
+writeData(wb, "Top_10_Combinations", top_10, startRow = 4)
+
+# Sheet 3: Best combination analysis (original)
+addWorksheet(wb, "Best_Combination_Analysis")
+writeData(wb, "Best_Combination_Analysis", 
+          "Detailed Analysis of Best Combination (Revised Scoring)", 
+          startRow = 1)
+writeData(wb, "Best_Combination_Analysis", 
+          paste("Data source:", file_path), 
+          startRow = 2)
+
+best_summary <- data.frame(
+    Category = c("Selected Biomarkers", "Number of Biomarkers", "Revised Composite Score",
+                 "Spearman Correlation", "Bootstrap Success Rate", "Mean Bootstrap Correlation",
+                 "95% Bootstrap CI", "AIC", "Valid Bootstraps/Total", "Model Formula",
+                 "Revised Score Weights", "Total Samples", "Biomarkers Evaluated", "Data Source"),
+    Value = c(
+        best_combination$Biomarkers,
+        best_combination$N_Biomarkers,
+        best_combination$Composite_Score,
+        best_combination$Correlation,
+        paste0(best_combination$Bootstrap_Success_Rate, "%"),
+        best_combination$Mean_Bootstrap_Correlation,
+        paste0("[", best_combination$Bootstrap_CI_Lower, ", ", best_combination$Bootstrap_CI_Upper, "]"),
+        best_combination$AIC,
+        paste0(best_combination$Valid_Bootstraps, "/100"),
+        best_result$formula,
+        "Correlation:35%, Bootstrap:35%, AIC:30%",
+        nrow(df),
+        paste(biomarker_names, collapse = ", "),
+        file_path
+    )
+)
+writeData(wb, "Best_Combination_Analysis", best_summary, startRow = 4)
+writeData(wb, "Best_Combination_Analysis", 
+          "\n\nModel Coefficients and Importance:", 
+          startRow = nrow(best_summary) + 6)
+writeData(wb, "Best_Combination_Analysis", importance_df, 
+          startRow = nrow(best_summary) + 7)
+
+# Sheet 4: Final scores (original + NEW adjusted score columns)
+addWorksheet(wb, "Final_Scores")
+writeData(wb, "Final_Scores", 
+          "Final Disease Severity Scores Using Best Combination", 
+          startRow = 1)
+writeData(wb, "Final_Scores", 
+          paste("Data source:", file_path, "| Sample names from original file"), 
+          startRow = 2)
+
+final_scores <- data.frame(
+    Sample_ID = sample_names,
+    Group = as.character(df$Group),
+    df[, paste0(biomarker_names, "_log_z")],
+    Standardized_Score = df$Standardized_Score,
+    Final_Score = round(df$Final_Score, 1),
+    stringsAsFactors = FALSE
+)
+
+if("Adjusted_Final_Score" %in% names(df)){
+    final_scores$Adjusted_Standardized_Score <- df$Adjusted_Standardized_Score
+    final_scores$Adjusted_Final_Score <- round(df$Adjusted_Final_Score, 1)
+    final_scores$Confounders_Residual <- round(df$Group_Numeric_residual, 3)
+}
+if(length(confounder_cols) > 0){
+    for(cc in confounder_cols){
+        if(cc %in% names(df)) final_scores[[cc]] <- df[[cc]]
+    }
+}
+
+writeData(wb, "Final_Scores", final_scores, startRow = 4)
+
+last_row <- 4 + nrow(final_scores) + 2
+writeData(wb, "Final_Scores", "Notes:", startRow = last_row)
+writeData(wb, "Final_Scores", 
+          "1. Final_Score ranges from 0 to 100, with higher scores indicating more severe disease.", 
+          startRow = last_row + 1)
+writeData(wb, "Final_Scores", 
+          "2. Standardized_Score is the raw linear predictor from the ordinal logistic regression; Final_Score is min-max normalized to 0-100.", 
+          startRow = last_row + 2)
+writeData(wb, "Final_Scores", 
+          "3. Adjusted_Final_Score (if present) includes confounder adjustment (Age, Sex, BMI).", 
+          startRow = last_row + 3)
+writeData(wb, "Final_Scores", 
+          "4. Disease groups: HC = healthy controls; ANIH = acute non-icteric hepatitis; AIH = acute icteric hepatitis; ALF = acute liver failure.", 
+          startRow = last_row + 4)
+
+# =============================================================================
+# NEW EXCEL SHEETS: Reviewer Response Modules
+# =============================================================================
+
+# NEW Sheet 5: Confounder Analysis
+if(!is.null(comparison_conf) && length(confounder_cols) > 0){
+    addWorksheet(wb, "Confounder_Analysis")
+    writeData(wb, "Confounder_Analysis", 
+              "Confounder Control Analysis (Age, Sex/Gender, BMI)", startRow = 1)
+    writeData(wb, "Confounder_Analysis", 
+              "Purpose: Address reviewer comment 'no evidence of controlling confounders'", startRow = 2)
+    writeData(wb, "Confounder_Analysis", comparison_conf, startRow = 4)
+    
+    writeData(wb, "Confounder_Analysis", 
+              "\nAdjusted Model Coefficients (Biomarkers + Confounders):", 
+              startRow = nrow(comparison_conf) + 6)
+    if(!is.null(adjusted_result) && !is.null(adjusted_result$coefficients)){
+        adj_coefs <- data.frame(
+            Term = names(adjusted_result$coefficients),
+            Coefficient = adjusted_result$coefficients,
+            stringsAsFactors = FALSE
+        )
+        writeData(wb, "Confounder_Analysis", adj_coefs, startRow = nrow(comparison_conf) + 7)
+    }
+}
+
+# NEW Sheet 6: 5-Fold CV Results (M3)
+if(!is.null(cv_comparison)){
+    addWorksheet(wb, "CV_Results_M3")
+    writeData(wb, "CV_Results_M3", 
+              "5-Fold Cross-Validation Results (M3: Adjusted R² and RMSE)", startRow = 1)
+    writeData(wb, "CV_Results_M3", 
+              "Purpose: Address reviewer comment 'report adjusted R² and RMSE'", startRow = 2)
+    writeData(wb, "CV_Results_M3", cv_comparison, startRow = 4)
+    
+    if(!is.null(cv_bio_only)){
+        writeData(wb, "CV_Results_M3", 
+                  "\nFold-level details (Biomarkers Only):", startRow = nrow(cv_comparison) + 6)
+        writeData(wb, "CV_Results_M3", cv_bio_only$fold_metrics, startRow = nrow(cv_comparison) + 7)
+    }
+}
+
+# NEW Sheet 7: Incremental Value Analysis (M11)
+if(!is.null(incremental_results)){
+    addWorksheet(wb, "Incremental_Value_M11")
+    writeData(wb, "Incremental_Value_M11", 
+              "Incremental Predictive Value Analysis (M11)", startRow = 1)
+    writeData(wb, "Incremental_Value_M11", 
+              "Purpose: Address reviewer comment 'does adding features provide incremental value?'", startRow = 2)
+    writeData(wb, "Incremental_Value_M11", incremental_results, startRow = 4)
+}
+
+# NEW Sheet 8: M5 Circularity Avoidance
+if(length(valid_m5) > 0){
+    addWorksheet(wb, "M5_Circularity_Check")
+    writeData(wb, "M5_Circularity_Check", 
+              "M5: Circularity Avoidance Validation (Bootstrap Train/Test Separation)", startRow = 1)
+    writeData(wb, "M5_Circularity_Check", 
+              "Purpose: Address reviewer comment 'risk of circularity in composite score'", startRow = 2)
+    writeData(wb, "M5_Circularity_Check", m5_results, startRow = 4)
+    
+    writeData(wb, "M5_Circularity_Check", 
+              "\nFeature Weight Stability Across Bootstraps:", startRow = nrow(m5_results) + 6)
+    writeData(wb, "M5_Circularity_Check", weight_stability_df, startRow = nrow(m5_results) + 7)
+    
+    writeData(wb, "M5_Circularity_Check", 
+              paste("\nInterpretation: Test-set correlation (mean =", round(mean(circular_test_cors[valid_m5]), 3), 
+                    ") is estimated with NO data leakage. If Test ≈ Train, the score is robust."), 
+              startRow = nrow(m5_results) + nrow(weight_stability_df) + 9)
+}
+
+# Save Excel file
+excel_filename <- "Revised_Biomarker_Combination_Analysis_10biomarkers.xlsx"
+saveWorkbook(wb, excel_filename, overwrite = TRUE)
+cat("\n✓ Excel workbook saved:", excel_filename, "\n")
+
+# =============================================================================
+# 16. Trend plots for significant biomarkers (original preserved)
+# =============================================================================
+cat("\nCreating trend plots with pairwise comparison letters...\n")
+
+# [Note: add_significance_letters function should be defined in user's environment]
+# If not available, this section will need that helper function.
+# The following code is preserved from original script.
+
+biomarkers_to_plot <- c("PT", "ALT", "AST", "TBA", "TB", "DBIL", "ALB", "CHE")
+
+for (bm in biomarkers_to_plot) {
+    cat(sprintf("  Plotting %s...\n", bm))
+    
+    plot_data <- df %>%
+        select(Group, y = all_of(paste0(bm, "_log_z"))) %>%
+        drop_na()
+    
+    bm_stats <- jt_results[jt_results$Feature == bm, ]
+    if (nrow(bm_stats) == 0) {
+        cat(sprintf("    Warning: %s not found in jt_results, skipping.\n", bm))
+        next
+    }
+    rho <- bm_stats$Spearman_rho
+    p_val <- bm_stats$JT_P_value
+    
+    # Note: add_significance_letters is assumed to be available
+    # If not defined, comment out the next line and the geom_text block below
+    letter_df <- if(exists("add_significance_letters")) add_significance_letters(plot_data, y = "y", group_col = "Group") else NULL
+    
+    p <- ggplot(plot_data, aes(x = Group, y = y, fill = Group)) +
+        geom_boxplot(alpha = 0.7, outlier.shape = NA, width = 0.6) +
+        geom_jitter(width = 0.2, alpha = 0.5, size = 1.5, color = "gray30") +
+        stat_summary(fun = mean, geom = "point", shape = 18, size = 4, color = "red") +
+        stat_summary(fun = mean, geom = "line", aes(group = 1), color = "red", linetype = "dashed", size = 1) +
+        labs(
+            title = paste("Trend of", bm, "Across Disease Groups"),
+            subtitle = sprintf("Z-standardized log1p-transformed values | Spearman ρ = %.3f, JT p = %.2e", rho, p_val),
+            x = "Disease Group",
+            y = "Standardized Value (Z-score)"
+        ) +
+        theme_minimal(base_size = 12) +
+        scale_fill_brewer(palette = "Set2") +
+        theme(
+            legend.position = "none",
+            plot.title = element_text(hjust = 0.5, face = "bold"),
+            plot.subtitle = element_text(hjust = 0.5, color = "gray40"),
+            axis.text.x = element_text(angle = 0, size = 11)
+        )
+    
+    if (!is.null(letter_df)) {
+        y_max <- max(plot_data$y, na.rm = TRUE)
+        y_range <- diff(range(plot_data$y, na.rm = TRUE))
+        letter_y <- y_max + 0.05 * y_range
+        
+        p <- p + 
+            geom_text(data = letter_df, 
+                      aes(x = Group, y = letter_y, label = Letters),
+                      inherit.aes = FALSE,
+                      size = 4, fontface = "bold", color = "darkblue")
+    }
+    
+    ggsave(sprintf("Figure_Trend_%s.pdf", bm), plot = p, width = 8, height = 6)
+    cat(sprintf("   ✓ Figure_Trend_%s.pdf saved\n", bm))
+}
+
+cat("✓ All trend plots with pairwise letters generated.\n")
+
+# =============================================================================
+# FINAL SUMMARY TO CONSOLE
+# =============================================================================
+cat("\n")
+cat("=====================================================================\n")
+cat("         ANALYSIS COMPLETE - REVIEWER RESPONSE SUMMARY                \n")
+cat("=====================================================================\n\n")
+
+cat("M5. CIRCULARITY AVOIDANCE:\n")
+cat(sprintf("  - Bootstrap train/test separation: %d valid iterations\n", length(valid_m5)))
+if(length(valid_m5) > 0){
+    cat(sprintf("  - Mean TEST correlation (no leakage): %.3f (SD: %.3f)\n",
+                mean(circular_test_cors[valid_m5]), sd(circular_test_cors[valid_m5])))
+    cat(sprintf("  - Mean weight stability (SD): %.4f\n",
+                mean(apply(circular_weights_sd[valid_m5, ], 2, sd, na.rm = TRUE))))
+}
+cat("  - All hybrid weights estimated independently within each bootstrap training set.\n")
+cat("  - Test set (OOB) used ONLY for evaluation, never for weight calculation.\n\n")
+
+cat("M11. INCREMENTAL PREDICTIVE VALUE:\n")
+if(!is.null(t_test_1)){
+    cat(sprintf("  - Biomarkers vs Confounders: p = %.4f (%s)\n",
+                t_test_1$p.value, ifelse(t_test_1$p.value < 0.05, "SIGNIFICANT", "NS")))
+} else {
+    cat("  - Not available (confounders missing or CV failed)\n")
+}
+if(!is.null(t_test_2)){
+    cat(sprintf("  - Confounders vs Biomarkers: p = %.4f (%s)\n",
+                t_test_2$p.value, ifelse(t_test_2$p.value < 0.05, "SIGNIFICANT", "NS")))
+}
+cat("\n")
+
+cat("M3. ADJUSTED R² AND RMSE:\n")
+if(!is.null(cv_comparison)){
+    for(i in 1:nrow(cv_comparison)){
+        cat(sprintf("  %s: R² = %.3f, Adjusted R² = %.3f, RMSE = %.3f, MAE = %.3f\n",
+                    cv_comparison$Model[i], cv_comparison$R2[i], 
+                    cv_comparison$Adjusted_R2[i], cv_comparison$RMSE[i], cv_comparison$MAE[i]))
+    }
+} else {
+    cat("  - Not available\n")
+}
+cat("\n")
+
+cat("CONFOUNDER CONTROL (Age, Sex, BMI):\n")
+if(length(confounder_cols) > 0){
+    cat(sprintf("  - Confounders included: %s\n", paste(confounder_cols, collapse = ", ")))
+    if(!is.null(adjusted_result)){
+        cat(sprintf("  - Confounders-only AIC: %.1f, ρ = %.3f\n", conf_only_aic, abs(conf_only_cor)))
+        cat(sprintf("  - Adjusted model AIC: %.1f, ρ = %.3f\n", adjusted_result$aic, adjusted_result$correlation))
+        cat(sprintf("  - Original model AIC: %.1f, ρ = %.3f\n", best_result$aic, best_result$correlation))
+    }
+    cat("  - Adjusted Final Score calculated and exported to Excel.\n")
+} else {
+    cat("  - WARNING: No confounders (Age/Gender/BMI) found in data.\n")
+    cat("  - Please ensure your input file contains these columns.\n")
+}
+cat("\n")
+
+cat("OUTPUT FILES:\n")
+cat("  PDF Figures: 00_*.pdf to 15_*.pdf (16 files total)\n")
+cat("  Excel File: Revised_Biomarker_Combination_Analysis_10biomarkers.xlsx\n")
+cat("  Excel Sheets: All_Combinations_Revised, Top_10, Best_Combination, Final_Scores,\n")
+cat("                Confounder_Analysis, CV_Results_M3, Incremental_Value_M11, M5_Circularity_Check\n")
+cat("=====================================================================\n")

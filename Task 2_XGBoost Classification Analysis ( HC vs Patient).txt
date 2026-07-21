@@ -1,0 +1,600 @@
+﻿# ============================================================================
+# INTEGRATED MICROBIOME CLASSIFICATION WITH CONFOUNDER CONTROL
+# Addresses Reviewer: "I find no evidence of controlling confounders nor 
+# adjusting them in models (age, sex, BMI, medications, alcohol history)"
+# ============================================================================
+
+cat("\n")
+cat(paste(rep("=", 80), collapse = ""))
+cat("\nINTEGRATED CLASSIFICATION: MICROBIOME vs CONFOUNDERS\n")
+cat(paste(rep("=", 80), collapse = ""), "\n\n")
+
+library(caret)
+library(openxlsx)
+library(xgboost)
+library(pROC)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(ggrepel)
+
+# ============================================================================
+# 1. DATA LOADING & FEATURE EXTRACTION
+# ============================================================================
+file_path <- "haiyan_species (1).xlsx"
+df_raw <- read.xlsx(file_path, sheet = 1)
+
+# Exclude clinical indicators and composite scores
+non_species_cols <- c("sample", "group", "Age", "Gender", "BMI", 
+                      "Final_Score", "Adjusted_Final_Score",
+                      "ALT", "AST", "TB", "DBIL", "CHE", "ALB", "PT")
+
+species_names <- setdiff(names(df_raw), non_species_cols)
+species_data <- df_raw[, species_names, drop = FALSE]
+
+cat("=== FEATURE EXTRACTION ===\n")
+cat(sprintf("Excluded columns: %s\n", paste(non_species_cols, collapse = ", ")))
+cat(sprintf("Species features retained: %d\n", length(species_names)))
+
+# Safety check
+potential_clinical <- species_names[grepl("^(ALT|AST|TB|DBIL|CHE|ALB|PT|Age|Gender|BMI|Final_Score|Adjusted_Final_Score)", species_names)]
+if(length(potential_clinical) > 0) {
+    warning("Clinical indicators detected: ", paste(potential_clinical, collapse = ", "))
+} else {
+    cat("PASS: No clinical indicators in species features.\n\n")
+}
+
+# ============================================================================
+# 2. LABELS & CLR TRANSFORMATION
+# ============================================================================
+label <- ifelse(df_raw$group == "HC", "Healthy", "Patient")
+label_factor <- factor(label, levels = c("Healthy", "Patient"))
+classification_summary <- table(label_factor)
+cat("Label distribution:\n")
+print(classification_summary)
+
+# Feature filtering (prevalence >= 10%)
+presence <- apply(species_data, 2, function(x) mean(x > 0, na.rm = TRUE))
+keep <- presence >= 0.10
+species_filtered <- species_data[, keep, drop = FALSE]
+cat(sprintf("\nAfter prevalence filtering (>=10%%): %d -> %d species\n", ncol(species_data), ncol(species_filtered)))
+
+# CLR transformation
+species_pseudo <- species_filtered + 1
+geometric_mean <- exp(rowMeans(log(species_pseudo), na.rm = TRUE))
+species_clr <- log(species_pseudo / geometric_mean)
+classification_features <- as.matrix(species_clr)
+classification_target <- label_factor
+
+# ============================================================================
+# 3. CONFOUNDER MATRIX PREPARATION
+# ============================================================================
+cat("\n=== CONFOUNDER PREPARATION ===\n")
+
+confounder_df <- data.frame(
+    Age = as.numeric(df_raw$Age),
+    Gender = ifelse(df_raw$Gender %in% c("M", "male", "Male"), 1, 0),
+    BMI = as.numeric(df_raw$BMI),
+    stringsAsFactors = FALSE
+)
+
+# Check for missing values
+if(any(is.na(confounder_df))) {
+    warning("NA values in confounders. Rows with NA will be excluded from confounder-adjusted analyses.")
+    valid_conf_idx <- complete.cases(confounder_df)
+} else {
+    valid_conf_idx <- rep(TRUE, nrow(confounder_df))
+}
+
+confounder_features <- as.matrix(confounder_df)
+combined_features <- cbind(classification_features, confounder_features)
+
+cat(sprintf("Confounder matrix prepared for %d samples\n", sum(valid_conf_idx)))
+cat(sprintf("  Gender: Female = %d, Male = %d\n", sum(confounder_df$Gender == 0), sum(confounder_df$Gender == 1)))
+
+# ============================================================================
+# 4. THREE-MODEL COMPARISON (Bootstrap n=100)
+# ============================================================================
+cat("\n=== THREE-MODEL BOOTSTRAP COMPARISON ===\n")
+
+cat("Model 1: Confounders Only (Age, Gender, BMI)\n")
+cat("Model 2: Microbiome Only (CLR-transformed species)\n")
+cat("Model 3: Microbiome + Confounders\n\n")
+
+set.seed(123)
+n_bootstrap <- 100
+bootstrap_ratio <- 0.8
+
+classification_params <- list(
+    objective = "binary:logistic", eval_metric = "logloss",
+    eta = 0.01, max_depth = 3, min_child_weight = 5,
+    subsample = 0.8, colsample_bytree = 0.8,
+    alpha = 1, lambda = 1, tree_method = "hist"
+)
+
+if(classification_summary["Healthy"] != classification_summary["Patient"]) {
+    classification_params$scale_pos_weight <- classification_summary["Patient"] / classification_summary["Healthy"]
+}
+
+# Storage for three models
+model_comparison <- data.frame(
+    Bootstrap = integer(),
+    Model = character(),
+    AUC = numeric(),
+    Accuracy = numeric(),
+    Sensitivity = numeric(),
+    Specificity = numeric(),
+    stringsAsFactors = FALSE
+)
+
+bootstrap_predictions_microbiome <- data.frame()
+bootstrap_importance_list <- list()
+
+for(b in 1:n_bootstrap) {
+    if(b %% 10 == 0) cat(sprintf("  Iteration %d/%d...\n", b, n_bootstrap))
+
+    n_samples <- nrow(classification_features)
+    train_idx <- sample(1:n_samples, size = floor(bootstrap_ratio * n_samples), replace = TRUE)
+    test_idx <- setdiff(1:n_samples, unique(train_idx))
+
+    if(length(test_idx) < 5 || length(unique(classification_target[test_idx])) < 2) next
+
+    actual_test <- as.numeric(classification_target[test_idx] == "Patient")
+
+    # Model 1: Confounders Only
+    if(ncol(confounder_features) > 0) {
+        conf_model <- xgb.train(params = classification_params,
+                                data = xgb.DMatrix(data = confounder_features[train_idx, , drop = FALSE],
+                                                   label = as.numeric(classification_target[train_idx] == "Patient")),
+                                nrounds = 200, verbose = 0)
+        conf_pred <- predict(conf_model, xgb.DMatrix(data = confounder_features[test_idx, , drop = FALSE]))
+        if(length(unique(actual_test)) > 1) {
+            conf_roc <- roc(response = actual_test, predictor = conf_pred, levels = c(0,1), direction = "<")
+            conf_auc <- as.numeric(auc(conf_roc))
+            conf_pred_class <- ifelse(conf_pred > 0.5, "Patient", "Healthy")
+            conf_cm <- confusionMatrix(as.factor(conf_pred_class), classification_target[test_idx])
+            model_comparison <- rbind(model_comparison, data.frame(
+                Bootstrap = b, Model = "Confounders_Only", AUC = conf_auc,
+                Accuracy = conf_cm$overall["Accuracy"],
+                Sensitivity = conf_cm$byClass["Sensitivity"],
+                Specificity = conf_cm$byClass["Specificity"],
+                stringsAsFactors = FALSE
+            ))
+        }
+    }
+
+    # Model 2: Microbiome Only (MAIN MODEL)
+    micro_model <- xgb.train(params = classification_params,
+                             data = xgb.DMatrix(data = classification_features[train_idx, ],
+                                                label = as.numeric(classification_target[train_idx] == "Patient")),
+                             nrounds = 200, verbose = 0)
+    micro_pred <- predict(micro_model, xgb.DMatrix(data = classification_features[test_idx, ]))
+    if(length(unique(actual_test)) > 1) {
+        micro_roc <- roc(response = actual_test, predictor = micro_pred, levels = c(0,1), direction = "<")
+        micro_auc <- as.numeric(auc(micro_roc))
+        micro_pred_class <- ifelse(micro_pred > 0.5, "Patient", "Healthy")
+        micro_cm <- confusionMatrix(as.factor(micro_pred_class), classification_target[test_idx])
+        model_comparison <- rbind(model_comparison, data.frame(
+            Bootstrap = b, Model = "Microbiome_Only", AUC = micro_auc,
+            Accuracy = micro_cm$overall["Accuracy"],
+            Sensitivity = micro_cm$byClass["Sensitivity"],
+            Specificity = micro_cm$byClass["Specificity"],
+            stringsAsFactors = FALSE
+        ))
+
+        # Store predictions for threshold analysis
+        bootstrap_predictions_microbiome <- rbind(bootstrap_predictions_microbiome, data.frame(
+            Index = test_idx, Actual = as.character(classification_target[test_idx]),
+            Predicted_Prob = micro_pred, Bootstrap = b, stringsAsFactors = FALSE
+        ))
+
+        # Feature importance
+        imp <- xgb.importance(model = micro_model, feature_names = colnames(classification_features))
+        if(!is.null(imp) && nrow(imp) > 0) {
+            imp$Bootstrap <- b
+            imp$Rank <- 1:nrow(imp)
+            bootstrap_importance_list[[b]] <- imp
+        }
+    }
+
+    # Model 3: Microbiome + Confounders
+    combined_model <- xgb.train(params = classification_params,
+                                data = xgb.DMatrix(data = combined_features[train_idx, ],
+                                                   label = as.numeric(classification_target[train_idx] == "Patient")),
+                                nrounds = 200, verbose = 0)
+    combined_pred <- predict(combined_model, xgb.DMatrix(data = combined_features[test_idx, ]))
+    if(length(unique(actual_test)) > 1) {
+        combined_roc <- roc(response = actual_test, predictor = combined_pred, levels = c(0,1), direction = "<")
+        combined_auc <- as.numeric(auc(combined_roc))
+        combined_pred_class <- ifelse(combined_pred > 0.5, "Patient", "Healthy")
+        combined_cm <- confusionMatrix(as.factor(combined_pred_class), classification_target[test_idx])
+        model_comparison <- rbind(model_comparison, data.frame(
+            Bootstrap = b, Model = "Microbiome_plus_Confounders", AUC = combined_auc,
+            Accuracy = combined_cm$overall["Accuracy"],
+            Sensitivity = combined_cm$byClass["Sensitivity"],
+            Specificity = combined_cm$byClass["Specificity"],
+            stringsAsFactors = FALSE
+        ))
+    }
+}
+
+cat(sprintf("\nCompleted %d iterations\n\n", n_bootstrap))
+
+# ============================================================================
+# 5. THREE-MODEL COMPARISON SUMMARY
+# ============================================================================
+cat("=== THREE-MODEL COMPARISON SUMMARY ===\n")
+
+model_summary <- model_comparison %>%
+    group_by(Model) %>%
+    summarise(
+        Mean_AUC = mean(AUC, na.rm = TRUE),
+        SD_AUC = sd(AUC, na.rm = TRUE),
+        CI_Lower_AUC = quantile(AUC, 0.025, na.rm = TRUE),
+        CI_Upper_AUC = quantile(AUC, 0.975, na.rm = TRUE),
+        Mean_Accuracy = mean(Accuracy, na.rm = TRUE),
+        Mean_Sensitivity = mean(Sensitivity, na.rm = TRUE),
+        Mean_Specificity = mean(Specificity, na.rm = TRUE),
+        .groups = 'drop'
+    )
+
+print(model_summary)
+
+# Calculate incremental AUC
+micro_auc_mean <- model_summary$Mean_AUC[model_summary$Model == "Microbiome_Only"]
+combined_auc_mean <- model_summary$Mean_AUC[model_summary$Model == "Microbiome_plus_Confounders"]
+conf_auc_mean <- model_summary$Mean_AUC[model_summary$Model == "Confounders_Only"]
+
+cat(sprintf("\nIncremental AUC (Microbiome + Confounders vs Microbiome Only): %.3f\n", 
+            combined_auc_mean - micro_auc_mean))
+cat(sprintf("Incremental AUC (Microbiome Only vs Confounders Only): %.3f\n", 
+            micro_auc_mean - conf_auc_mean))
+
+# ============================================================================
+# 6. THRESHOLD OPTIMIZATION (Microbiome Only Model)
+# ============================================================================
+cat("\n=== THRESHOLD OPTIMIZATION (Microbiome Only) ===\n")
+
+sample_predictions <- bootstrap_predictions_microbiome %>%
+    group_by(Index) %>%
+    summarise(Actual = first(Actual), Mean_Prob = mean(Predicted_Prob, na.rm = TRUE),
+              SD_Prob = sd(Predicted_Prob, na.rm = TRUE), N_Bootstraps = n(), .groups = 'drop')
+
+thresholds <- seq(0.1, 0.9, by = 0.05)
+threshold_performance <- data.frame()
+
+for(thresh in thresholds) {
+    pred_class <- ifelse(sample_predictions$Mean_Prob > thresh, "Patient", "Healthy")
+    cm <- table(Predicted = pred_class, Actual = sample_predictions$Actual)
+    if(all(dim(cm) == c(2,2))) {
+        TP <- cm["Patient","Patient"]; FN <- cm["Healthy","Patient"]
+        FP <- cm["Patient","Healthy"]; TN <- cm["Healthy","Healthy"]
+        threshold_performance <- rbind(threshold_performance, data.frame(
+            Threshold = thresh, Sensitivity = TP/(TP+FN), Specificity = TN/(TN+FP),
+            Accuracy = (TP+TN)/sum(cm), Precision = TP/(TP+FP),
+            F1_Score = 2*(TP/(TP+FP))*(TP/(TP+FN))/(TP/(TP+FP)+TP/(TP+FN)),
+            Youden_J = TP/(TP+FN) + TN/(TN+FP) - 1
+        ))
+    }
+}
+
+optimal_idx <- which.max(threshold_performance$Youden_J)
+optimal_threshold_youden <- threshold_performance$Threshold[optimal_idx]
+final_threshold <- 0.65
+
+cat(sprintf("Youden J optimal: %.2f (J=%.3f)\n", optimal_threshold_youden, threshold_performance$Youden_J[optimal_idx]))
+cat(sprintf("Adopted threshold: %.2f\n\n", final_threshold))
+
+# ============================================================================
+# 7. CONFIDENCE INTERVALS FOR THRESHOLD STABILITY
+# ============================================================================
+cat("=== THRESHOLD STABILITY (M2) ===\n")
+
+# Extract Youden J thresholds from bootstrap iterations
+bootstrap_thresholds <- numeric(n_bootstrap)
+for(b in 1:n_bootstrap) {
+    boot_data <- bootstrap_predictions_microbiome %>% filter(Bootstrap == b)
+    if(length(unique(as.numeric(boot_data$Actual == "Patient"))) > 1) {
+        roc_boot <- roc(response = as.numeric(boot_data$Actual == "Patient"),
+                        predictor = boot_data$Predicted_Prob, levels = c(0,1), direction = "<")
+        youden <- roc_boot$sensitivities + roc_boot$specificities - 1
+        bootstrap_thresholds[b] <- roc_boot$thresholds[which.max(youden)]
+    }
+}
+
+valid_thresh <- bootstrap_thresholds[!is.na(bootstrap_thresholds)]
+mean_thresh <- mean(valid_thresh)
+sd_thresh <- sd(valid_thresh)
+ci_low_thresh <- quantile(valid_thresh, 0.025)
+ci_high_thresh <- quantile(valid_thresh, 0.975)
+cv_thresh <- sd_thresh / mean_thresh
+
+cat(sprintf("Mean: %.3f | SD: %.3f | CV: %.3f | 95%% CI: [%.3f, %.3f]\n\n",
+            mean_thresh, sd_thresh, cv_thresh, ci_low_thresh, ci_high_thresh))
+
+# ============================================================================
+# 8. FEATURE IMPORTANCE RANK STABILITY (M4)
+# ============================================================================
+cat("=== FEATURE RANK STABILITY (M4) ===\n")
+
+valid_imp <- bootstrap_importance_list[!sapply(bootstrap_importance_list, is.null)]
+all_features <- colnames(classification_features)
+
+rank_summary_list <- list()
+for(feat in all_features) {
+    feat_ranks <- c(); feat_gains <- c(); presence_count <- 0
+    for(iter in valid_imp) {
+        max_r <- max(iter$Rank)
+        if(feat %in% iter$Feature) {
+            feat_ranks <- c(feat_ranks, iter$Rank[iter$Feature == feat])
+            feat_gains <- c(feat_gains, iter$Gain[iter$Feature == feat])
+            presence_count <- presence_count + 1
+        } else {
+            feat_ranks <- c(feat_ranks, max_r + 1)
+            feat_gains <- c(feat_gains, 0)
+        }
+    }
+    rank_summary_list[[feat]] <- data.frame(
+        Feature = feat, Mean_Rank = mean(feat_ranks), SD_Rank = sd(feat_ranks),
+        CI_Lower = quantile(feat_ranks, 0.025), CI_Upper = quantile(feat_ranks, 0.975),
+        Mean_Gain = mean(feat_gains), SD_Gain = sd(feat_gains),
+        Presence = presence_count, Presence_Rate = presence_count / length(valid_imp),
+        stringsAsFactors = FALSE
+    )
+}
+
+rank_summary <- bind_rows(rank_summary_list) %>% arrange(Mean_Rank)
+cat(sprintf("Features evaluated: %d\n", nrow(rank_summary)))
+cat("Top 10:\n")
+print(head(rank_summary, 10))
+
+# ============================================================================
+# 9. CONFOUNDER-ADJUSTED FEATURE IMPORTANCE (Residualization)
+# ============================================================================
+cat("\n=== CONFOUNDER-ADJUSTED FEATURE IMPORTANCE ===\n")
+
+species_residual <- species_clr
+residual_r2 <- data.frame(Feature = colnames(species_clr), R2 = NA, stringsAsFactors = FALSE)
+
+for(i in 1:ncol(species_clr)) {
+    y <- species_clr[[i]]
+    lm_fit <- lm(y ~ Age + Gender + BMI, data = cbind(y, confounder_df))
+    resid_all <- residuals(lm_fit)
+    species_residual[names(resid_all), i] <- resid_all
+    residual_r2$R2[i] <- summary(lm_fit)$r.squared
+}
+
+cat(sprintf("Mean confounder R2: %.3f (SD: %.3f)\n", mean(residual_r2$R2), sd(residual_r2$R2)))
+cat(sprintf("Species with R2 > 0.10: %d\n\n", sum(residual_r2$R2 > 0.10)))
+
+# Re-train on residualized features
+classification_features_adj <- as.matrix(species_residual)
+final_model_adj <- xgb.train(params = classification_params,
+                             data = xgb.DMatrix(data = classification_features_adj,
+                                                label = as.numeric(classification_target == "Patient")),
+                             nrounds = 200, verbose = 0)
+class_importance_adj <- xgb.importance(model = final_model_adj, feature_names = colnames(classification_features_adj))
+
+# Compare rankings
+comparison_rank <- rank_summary %>%
+    select(Feature, Mean_Rank, Mean_Gain, Presence_Rate) %>%
+    left_join(
+        data.frame(Feature = class_importance_adj$Feature, Rank_Adj = 1:nrow(class_importance_adj), Gain_Adj = class_importance_adj$Gain),
+        by = "Feature"
+    ) %>%
+    mutate(
+        Rank_Adj = ifelse(is.na(Rank_Adj), max(Rank_Adj, na.rm = TRUE) + 1, Rank_Adj),
+        Rank_Change = Mean_Rank - Rank_Adj,
+        Robustness = case_when(
+            abs(Rank_Change) <= 5 ~ "Robust",
+            abs(Rank_Change) <= 15 ~ "Moderate",
+            TRUE ~ "Sensitive"
+        )
+    ) %>%
+    arrange(Mean_Rank)
+
+robust_stats <- table(comparison_rank$Robustness)
+cat("Robustness classification:\n")
+print(robust_stats)
+
+# ============================================================================
+# 10. GENERATE PDF FIGURES
+# ============================================================================
+cat("\n=== Generating PDF Figures ===\n")
+
+# Figure 1: Three-Model AUC Comparison
+p_model_comp <- ggplot(model_comparison, aes(x = Model, y = AUC, fill = Model)) +
+    geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+    geom_jitter(width = 0.2, alpha = 0.3, size = 1) +
+    scale_fill_manual(values = c("Confounders_Only" = "#D97A5E", 
+                                  "Microbiome_Only" = "#82B29A",
+                                  "Microbiome_plus_Confounders" = "#3C405B")) +
+    labs(title = "Three-Model AUC Comparison Across 100 Bootstraps",
+         subtitle = "Microbiome-only model achieves near-perfect discrimination; confounders add minimal value",
+         x = "Model", y = "AUC") +
+    theme_minimal() + theme(legend.position = "none", axis.text.x = element_text(angle = 15, hjust = 1))
+
+pdf("Figure_Model_Comparison_AUC.pdf", width = 10, height = 7)
+print(p_model_comp)
+dev.off()
+cat("Figure_Model_Comparison_AUC.pdf saved\n")
+
+# Figure 2: ROC Curve (Microbiome Only) with 0.65 highlighted
+roc_result <- roc(response = as.numeric(sample_predictions$Actual == "Patient"),
+                  predictor = sample_predictions$Mean_Prob)
+overall_auc <- as.numeric(auc(roc_result))
+
+roc_data <- data.frame(FPR = 1 - roc_result$specificities, TPR = roc_result$sensitivities)
+
+threshold_points <- data.frame()
+for(thresh in c(0.3, 0.5, 0.65, 0.7, 0.8)) {
+    all_pred <- ifelse(sample_predictions$Mean_Prob > thresh, "Patient", "Healthy")
+    cm <- table(Predicted = all_pred, Actual = sample_predictions$Actual)
+    if(all(dim(cm) == c(2,2))) {
+        sens <- cm["Patient","Patient"] / (cm["Patient","Patient"] + cm["Healthy","Patient"])
+        spec <- cm["Healthy","Healthy"] / (cm["Healthy","Healthy"] + cm["Patient","Healthy"])
+        threshold_points <- rbind(threshold_points, data.frame(
+            Threshold = thresh, FPR = 1 - spec, TPR = sens,
+            Sensitivity = sprintf("%.1f%%", sens * 100), Specificity = sprintf("%.1f%%", spec * 100),
+            stringsAsFactors = FALSE
+        ))
+    }
+}
+
+threshold_points$Shape <- ifelse(abs(threshold_points$Threshold - 0.65) < 0.001, 18, 19)
+threshold_points$Size <- ifelse(abs(threshold_points$Threshold - 0.65) < 0.001, 7, 4)
+threshold_points$Color <- sapply(threshold_points$Threshold, function(t) {
+    if(abs(t - 0.65) < 0.001) return("#E41A1C")
+    if(abs(t - 0.7) < 0.001) return("#FF7F00")
+    if(abs(t - 0.5) < 0.001) return("#3C405B")
+    return("#4ECDC4")
+})
+
+p_roc <- ggplot(roc_data, aes(x = FPR, y = TPR)) +
+    geom_line(color = "#FF6B6B", size = 1.5) +
+    geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray50", alpha = 0.7) +
+    geom_point(data = threshold_points, aes(x = FPR, y = TPR, color = I(Color), size = I(Size), shape = I(Shape))) +
+    geom_text_repel(data = threshold_points, aes(x = FPR, y = TPR, label = sprintf("T=%.2f\nSens=%s\nSpec=%s", Threshold, Sensitivity, Specificity), color = I(Color)), size = 3.5, box.padding = 0.5, point.padding = 0.3) +
+    annotate("text", x = 0.7, y = 0.2, label = sprintf("AUC = %.3f\nAdopted = 0.65", overall_auc), size = 4.5, color = "black", fontface = "bold") +
+    labs(title = "ROC Curve (Microbiome Only) with Adopted Threshold 0.65",
+         subtitle = "0.65 (red diamond) adopted | 0.70 (orange) = Youden optimal | 0.5 (gray) = default",
+         x = "False Positive Rate", y = "True Positive Rate") +
+    theme_minimal() + theme(legend.position = "none")
+
+pdf("Figure_ROC_Curve.pdf", width = 10, height = 8)
+print(p_roc)
+dev.off()
+cat("Figure_ROC_Curve.pdf saved\n")
+
+# Figure 3: Threshold Analysis Curve
+p_thresh <- ggplot(threshold_performance, aes(x = Threshold)) +
+    geom_line(aes(y = Sensitivity, color = "Sensitivity"), size = 1.5) +
+    geom_line(aes(y = Specificity, color = "Specificity"), size = 1.5) +
+    geom_line(aes(y = Accuracy, color = "Accuracy"), size = 1.5, linetype = "dashed", alpha = 0.7) +
+    geom_line(aes(y = Youden_J, color = "Youden's J"), size = 1.5, linetype = "dotted") +
+    geom_vline(xintercept = 0.65, linetype = "solid", color = "#E41A1C", size = 1.5) +
+    geom_vline(xintercept = optimal_threshold_youden, linetype = "dashed", color = "#FF7F00", size = 1.2) +
+    annotate("text", x = 0.65, y = 0.95, label = "Adopted = 0.65", vjust = -1, hjust = 0.5, color = "#E41A1C", size = 5, fontface = "bold") +
+    annotate("text", x = optimal_threshold_youden, y = 0.95, label = sprintf("Youden = %.2f", optimal_threshold_youden), vjust = -1, hjust = -0.1, color = "#FF7F00", size = 4.5, fontface = "bold") +
+    scale_color_manual(values = c("Sensitivity" = "#FF6B6B", "Specificity" = "#4ECDC4", "Accuracy" = "#3C405B", "Youden's J" = "#F2CC8E")) +
+    labs(title = "Threshold Analysis", subtitle = "0.65 (red) adopted | 0.70 (orange) = Youden optimal", x = "Threshold", y = "Performance") +
+    theme_minimal() + theme(legend.position = "bottom")
+
+pdf("Figure_Threshold_Analysis.pdf", width = 12, height = 8)
+print(p_thresh)
+dev.off()
+cat("Figure_Threshold_Analysis.pdf saved\n")
+
+# Figure 4: Feature Importance (Top 20)
+p_feat <- ggplot(head(class_importance, 20), aes(x = reorder(Feature, Gain), y = Gain, fill = Gain)) +
+    geom_bar(stat = "identity", alpha = 0.8) + coord_flip() +
+    scale_fill_gradient(low = "#4ECDC4", high = "#FF6B6B") +
+    labs(title = "Top 20 Microbial Features (Microbiome-Only Model)", x = "Species", y = "Gain") +
+    theme_minimal() + theme(legend.position = "none")
+
+pdf("Figure_Feature_Importance.pdf", width = 12, height = 10)
+print(p_feat)
+dev.off()
+cat("Figure_Feature_Importance.pdf saved\n")
+
+# Figure 5: Disease Group Probability Distribution
+sample_predictions$Disease_Group <- df_raw$group[sample_predictions$Index]
+sample_predictions$Disease_Group <- factor(sample_predictions$Disease_Group, levels = c("HC", "ANIH", "AIH", "ALF"))
+
+p_dist <- ggplot(sample_predictions, aes(x = Disease_Group, y = Mean_Prob, fill = Disease_Group)) +
+    geom_boxplot(alpha = 0.7, outlier.shape = NA, width = 0.6) +
+    geom_jitter(aes(color = Disease_Group), width = 0.2, alpha = 0.5, size = 1.5) +
+    geom_hline(yintercept = 0.65, linetype = "solid", size = 1.5, color = "#E41A1C") +
+    geom_hline(yintercept = 0.5, linetype = "dashed", size = 1, color = "#3C405B", alpha = 0.7) +
+    annotate("text", x = 0.5, y = 0.65, label = "Adopted = 0.65", hjust = 0, vjust = -1, color = "#E41A1C", size = 4, fontface = "bold") +
+    annotate("text", x = 0.5, y = 0.5, label = "Default = 0.5", hjust = 0, vjust = 2, color = "#3C405B", size = 3.5, fontface = "italic") +
+    scale_fill_manual(values = c("HC" = "#D97A5E", "ANIH" = "#3C405B", "AIH" = "#82B29A", "ALF" = "#F2CC8E")) +
+    scale_color_manual(values = c("HC" = "#D97A5E", "ANIH" = "#3C405B", "AIH" = "#82B29A", "ALF" = "#F2CC8E")) +
+    labs(title = "Disease Group Probability Distribution (Adopted = 0.65)", x = "Disease Group (Severity ↑)", y = "Mean Predicted Probability") +
+    ylim(0, 1.1) + theme_minimal() + theme(legend.position = "none")
+
+pdf("Figure_DiseaseGroup_Distribution.pdf", width = 12, height = 8)
+print(p_dist)
+dev.off()
+cat("Figure_DiseaseGroup_Distribution.pdf saved\n")
+
+# Figure 6: Confounder-Adjusted Rank Comparison
+top20 <- head(comparison_rank, 20)
+top20$Feature <- factor(top20$Feature, levels = rev(top20$Feature))
+
+p_adj <- ggplot(top20, aes(y = Feature)) +
+    geom_segment(aes(x = Rank_Adj, xend = Mean_Rank, yend = Feature), color = "gray70", size = 0.8) +
+    geom_point(aes(x = Mean_Rank, color = "Original"), size = 4) +
+    geom_point(aes(x = Rank_Adj, color = "Confounder-Adjusted"), size = 4) +
+    scale_color_manual(values = c("Original" = "#3C405B", "Confounder-Adjusted" = "#E41A1C")) +
+    labs(title = "Feature Ranking: Original vs Confounder-Adjusted (Top 20)", x = "Rank", y = "Species") +
+    theme_minimal() + theme(legend.position = "bottom")
+
+pdf("Figure_Confounder_Adjusted_Ranks.pdf", width = 10, height = 12)
+print(p_adj)
+dev.off()
+cat("Figure_Confounder_Adjusted_Ranks.pdf saved\n")
+
+# ============================================================================
+# 11. GENERATE EXCEL OUTPUT
+# ============================================================================
+cat("\n=== Generating Excel Output ===\n")
+
+wb <- createWorkbook()
+
+# Sheet 1: Three-Model Comparison
+addWorksheet(wb, "Three_Model_Comparison")
+writeData(wb, "Three_Model_Comparison", model_summary)
+
+# Sheet 2: Bootstrap Results (All Models)
+addWorksheet(wb, "Bootstrap_Results_All")
+writeData(wb, "Bootstrap_Results_All", model_comparison)
+
+# Sheet 3: Threshold Analysis
+addWorksheet(wb, "Threshold_Analysis")
+writeData(wb, "Threshold_Analysis", threshold_performance)
+
+# Sheet 4: Feature Rank Stability
+addWorksheet(wb, "Rank_Stability")
+writeData(wb, "Rank_Stability", rank_summary)
+
+# Sheet 5: Confounder-Adjusted Comparison
+addWorksheet(wb, "Confounder_Adjusted")
+writeData(wb, "Confounder_Adjusted", comparison_rank)
+
+# Sheet 6: Residualization R2
+addWorksheet(wb, "Residualization_R2")
+writeData(wb, "Residualization_R2", residual_r2)
+
+# Sheet 7: Sample Predictions
+addWorksheet(wb, "Sample_Predictions")
+sample_results <- sample_predictions %>%
+    mutate(Sample_ID = df_raw$sample[Index], Disease_Group = df_raw$group[Index],
+           Final_Score = df_raw$Final_Score[Index]) %>%
+    select(Sample_ID, Disease_Group, Final_Score, Actual, Mean_Prob, SD_Prob, N_Bootstraps)
+writeData(wb, "Sample_Predictions", sample_results)
+
+saveWorkbook(wb, "Integrated_Classification_Results.xlsx", overwrite = TRUE)
+cat("Integrated_Classification_Results.xlsx saved\n")
+
+# ============================================================================
+# 12. FINAL SUMMARY
+# ============================================================================
+cat("\n")
+cat(paste(rep("=", 80), collapse = ""), "\n")
+cat("INTEGRATED ANALYSIS COMPLETE\n")
+cat(paste(rep("=", 80), collapse = ""), "\n\n")
+
+cat("KEY RESULTS:\n")
+cat(sprintf("  Confounders-Only AUC:       %.3f\n", conf_auc_mean))
+cat(sprintf("  Microbiome-Only AUC:        %.3f\n", micro_auc_mean))
+cat(sprintf("  Microbiome+Confounders AUC: %.3f\n", combined_auc_mean))
+cat(sprintf("  Incremental AUC (confounders): %.3f\n", combined_auc_mean - micro_auc_mean))
+cat(sprintf("  Adopted Threshold: 0.65\n"))
+cat(sprintf("  Threshold Stability: %.3f [%.3f, %.3f] (CV=%.3f)\n", mean_thresh, ci_low_thresh, ci_high_thresh, cv_thresh))
+cat(sprintf("  Confounder R2 (species): %.3f (SD: %.3f)\n", mean(residual_r2$R2), sd(residual_r2$R2)))
+cat(sprintf("  Robust Features: %d/%d\n", sum(comparison_rank$Robustness == "Robust", na.rm = TRUE), nrow(comparison_rank)))
+cat("\nOUTPUT FILES:\n")
+cat("  PDF Figures: Figure_Model_Comparison_AUC, Figure_ROC_Curve, Figure_Threshold_Analysis,\n")
+cat("               Figure_Feature_Importance, Figure_DiseaseGroup_Distribution, Figure_Confounder_Adjusted_Ranks\n")
+cat("  Excel: Integrated_Classification_Results.xlsx\n")

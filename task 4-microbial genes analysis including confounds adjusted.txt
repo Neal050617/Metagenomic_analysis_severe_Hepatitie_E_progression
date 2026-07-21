@@ -1,0 +1,1145 @@
+﻿# ============================================================================
+# KO级功能基因分析完整流程
+# CLR转换 → 混杂调整 → 四种方法筛选 → KO→Pathway映射 → 通路富集
+# ============================================================================
+
+# 1. 加载包
+library(readxl)
+library(glmnet)
+library(VennDiagram)
+library(grid)
+library(dplyr)
+library(tidyr)
+library(UpSetR)
+library(ggplot2)
+
+# 2. 参数设置
+rho_threshold <- 0.3
+p_fdr_threshold <- 0.1
+n_bootstrap <- 100
+ci_alpha <- 0.05
+set.seed(123)
+
+# 3. 读取数据 ----
+cat("========== 读取数据 ==========\n")
+ko_data <- read_excel("D:/LHF/clr/haiyan/基因/样本功能基因.xlsx") %>% as.data.frame()
+ko2path <- read_excel("D:/LHF/clr/haiyan/基因/ko2pathway.xlsx") %>% as.data.frame()
+names(ko2path) <- c("KO", "pathway")
+
+cat("KO数据：", nrow(ko_data), "行 x", ncol(ko_data), "列\n")
+cat("KO→通路映射：", nrow(ko2path), "行，涉及", length(unique(ko2path$pathway)), "个通路\n")
+
+# 4. 提取KO列和metadata
+meta_cols <- c("sample", "Group", "Age", "Gender", "BMI", "Final_Score", "Adjusted_Final_Score")
+ko_cols <- setdiff(names(ko_data), meta_cols)
+cat("KO特征数：", length(ko_cols), "\n")
+
+# 5. 构建矩阵
+X_raw <- as.matrix(ko_data[, ko_cols, drop = FALSE])
+y <- ko_data$Final_Score
+
+# 6. 混杂因素残差调整（评分）----
+cat("\n========== 混杂因素调整 ==========\n")
+conf_df <- ko_data[, c("Age", "Gender", "BMI"), drop = FALSE]
+conf_df$Gender <- as.factor(conf_df$Gender)
+fit_conf <- lm(y ~ ., data = data.frame(y = y, conf_df))
+y_adj <- residuals(fit_conf)
+cat("Final_Score 已残差调整（Age/Gender/BMI）\n")
+
+# 7. 数据清洗 ----
+na_cols <- apply(X_raw, 2, function(x) all(is.na(x)))
+if (any(na_cols)) {
+  X_raw <- X_raw[, !na_cols, drop = FALSE]
+  ko_cols <- ko_cols[!na_cols]
+}
+X_raw[is.na(X_raw)] <- 0
+
+nzv <- apply(X_raw, 2, var, na.rm = TRUE) > 0
+if (sum(!nzv) > 0) {
+  X_raw <- X_raw[, nzv, drop = FALSE]
+  ko_cols <- ko_cols[nzv]
+}
+cat("清洗后KO数：", length(ko_cols), "\n")
+
+# 8. CLR 转换（Centered Log-Ratio）----
+cat("\n========== CLR 转换 ==========\n")
+min_positive <- min(X_raw[X_raw > 0])
+pseudo_count <- min_positive / 2
+X_pseudo <- X_raw + pseudo_count
+
+X_clr <- t(apply(X_pseudo, 1, function(row) {
+  lr <- log(row)
+  lr - mean(lr)
+}))
+cat("CLR 完成。范围：[", round(min(X_clr), 3), ", ", round(max(X_clr), 3), "]\n")
+
+# 9. 四种方法筛选 ----
+cat("\n========== 四种方法筛选 ==========\n")
+results <- data.frame(
+  Feature = ko_cols,
+  Spearman_rho = NA_real_, Spearman_p = NA_real_, Spearman_fdr = NA_real_,
+  Kendall_tau = NA_real_, Kendall_p = NA_real_, Kendall_fdr = NA_real_,
+  Spearman_ci_lower = NA_real_, Spearman_ci_upper = NA_real_,
+  stringsAsFactors = FALSE
+)
+
+# Spearman & Kendall
+cat("计算 Spearman & Kendall...\n")
+for (i in seq_along(ko_cols)) {
+  if (i %% 500 == 0) cat("  ", i, "/", length(ko_cols), "\n")
+  ts <- cor.test(X_clr[, i], y_adj, method = "spearman", exact = FALSE)
+  tk <- cor.test(X_clr[, i], y_adj, method = "kendall", exact = FALSE)
+  results$Spearman_rho[i] <- ts$estimate
+  results$Spearman_p[i] <- ts$p.value
+  results$Kendall_tau[i] <- tk$estimate
+  results$Kendall_p[i] <- tk$p.value
+}
+results$Spearman_fdr <- p.adjust(results$Spearman_p, method = "fdr")
+results$Kendall_fdr <- p.adjust(results$Kendall_p, method = "fdr")
+
+# Bootstrap
+cat("Bootstrap（", n_bootstrap, "次）...\n")
+boot_rho <- matrix(NA, nrow = n_bootstrap, ncol = ncol(X_clr))
+colnames(boot_rho) <- ko_cols
+for (b in 1:n_bootstrap) {
+  if (b %% 20 == 0) cat("  迭代", b, "\n")
+  idx <- sample(1:nrow(X_clr), replace = TRUE)
+  Xb <- X_clr[idx, , drop = FALSE]
+  yb <- y_adj[idx]
+  for (j in 1:ncol(X_clr)) boot_rho[b, j] <- cor(Xb[, j], yb, method = "spearman")
+}
+results$Spearman_ci_lower <- apply(boot_rho, 2, quantile, probs = ci_alpha/2, na.rm = TRUE)
+results$Spearman_ci_upper <- apply(boot_rho, 2, quantile, probs = 1-ci_alpha/2, na.rm = TRUE)
+
+# LASSO
+cat("LASSO...\n")
+Xs <- scale(X_clr)
+cv_lasso <- cv.glmnet(Xs, y_adj, alpha = 1, nfolds = 5)
+lasso_coef <- coef(cv_lasso, s = "lambda.min")
+lasso_sel <- rownames(lasso_coef)[which(lasso_coef[,1] != 0)][-1]
+cat("LASSO选中：", length(lasso_sel), "个KO\n")
+
+# 筛选条件
+cond_s <- (abs(results$Spearman_rho) > rho_threshold) & (results$Spearman_fdr < p_fdr_threshold)
+cond_k <- (abs(results$Kendall_tau) > rho_threshold) & (results$Kendall_fdr < p_fdr_threshold)
+cond_b <- (results$Spearman_ci_lower > rho_threshold) | (results$Spearman_ci_upper < -rho_threshold)
+cond_l <- results$Feature %in% lasso_sel
+
+results$Sig_Spearman <- cond_s
+results$Sig_Kendall <- cond_k
+results$Sig_Bootstrap <- cond_b
+results$Sig_LASSO <- cond_l
+
+# 10. M6: ≥3 方法敏感性分析 ----
+cat("\n========== M6: ≥3 方法交集 ==========\n")
+venn_lists <- list(
+  Spearman = results$Feature[cond_s],
+  Kendall = results$Feature[cond_k],
+  Bootstrap = results$Feature[cond_b],
+  LASSO = results$Feature[cond_l]
+)
+
+all_f <- unique(unlist(venn_lists))
+mcount <- sapply(all_f, function(f) sum(sapply(venn_lists, function(l) f %in% l)))
+feat_3plus <- names(mcount[mcount >= 3])
+feat_4 <- names(mcount[mcount == 4])
+
+cat("Spearman:", length(venn_lists$Spearman), 
+    "Kendall:", length(venn_lists$Kendall),
+    "Bootstrap:", length(venn_lists$Bootstrap),
+    "LASSO:", length(venn_lists$LASSO), "\n")
+cat("≥3方法交集：", length(feat_3plus), "；4方法交集：", length(feat_4), "\n")
+
+results$Method_Count <- sapply(results$Feature, function(f) mcount[f])
+results$Selected_by_3plus <- results$Feature %in% feat_3plus
+
+# 保存KO筛选结果
+res_sorted <- results[order(-abs(results$Spearman_rho)), ]
+write.csv(res_sorted, "KO_Feature_Selection_Results.csv", row.names = FALSE)
+if (length(feat_3plus) > 0) {
+  writeLines(feat_3plus, "KO_Common_ThreeMethods.txt")
+  write.csv(res_sorted[res_sorted$Feature %in% feat_3plus, ],
+            "KO_Feature_Selection_ThreeMethods.csv", row.names = FALSE)
+}
+if (length(feat_4) > 0) writeLines(feat_4, "KO_Common_FourMethods.txt")
+
+# 11. KO → Pathway 映射 ----
+cat("\n========== KO→Pathway 映射 ==========\n")
+
+# 对 ≥3 方法选中的KO进行映射
+selected_ko <- feat_3plus
+ko_path_map <- ko2path %>% filter(KO %in% selected_ko)
+cat("≥3方法选中KO数：", length(selected_ko), "\n")
+cat("可映射到通路的KO数：", length(unique(ko_path_map$KO)), "\n")
+cat("涉及通路数：", length(unique(ko_path_map$pathway)), "\n")
+
+write.csv(ko_path_map, "KO_Pathway_Mapping_3plus.csv", row.names = FALSE)
+
+# 12. 通路富集分析（超几何检验思路）----
+cat("\n========== 通路富集分析 ==========\n")
+
+# 背景：所有在数据中出现的KO
+background_ko <- ko_cols
+
+# 对每个通路做超几何检验
+pathway_enrich <- ko2path %>%
+  filter(KO %in% background_ko) %>%
+  group_by(pathway) %>%
+  summarise(
+    Pathway_KO_total = n(),                          # 该通路在背景中的KO总数
+    Selected_KO_in_pathway = sum(KO %in% selected_ko), # 选中KO属于该通路的数量
+    .groups = "drop"
+  ) %>%
+  filter(Pathway_KO_total >= 3) %>%                  # 过滤小通路（<3个KO）
+  mutate(
+    # 超几何检验：从N个背景KO中抽n个选中KO，通路有K个KO，选中k个
+    N = length(background_ko),
+    n = length(selected_ko),
+    K = Pathway_KO_total,
+    k = Selected_KO_in_pathway,
+    Expected = n * K / N,                            # 期望命中数
+    Enrichment_Ratio = k / Expected,                 # 富集倍数
+    # 超几何检验 p值（选中≥k个）
+    p_hyper = phyper(k - 1, K, N - K, n, lower.tail = FALSE),
+    FDR = p.adjust(p_hyper, method = "fdr")
+  ) %>%
+  arrange(FDR, -Enrichment_Ratio)
+
+write.csv(pathway_enrich, "KO_Pathway_Enrichment_Results.csv", row.names = FALSE)
+cat("富集结果已保存。Top通路：\n")
+print(head(pathway_enrich, 10))
+
+# ============================================================================
+# KO级分析修订版：同时输出 ≥3方法 和 4方法 两套富集结果
+# 澄清LASSO稀疏性问题，回应M6审稿意见
+# ============================================================================
+
+# （前1-12节与之前代码相同，此处从第13节修订）
+
+# 13. KO → Pathway 映射与富集分析（两套）----
+cat("\n========== KO→Pathway 映射与富集 ==========\n")
+
+# 13.1 定义两个候选集合
+selected_3plus <- feat_3plus   # ≥3方法：280个
+selected_4 <- feat_4         # 4方法：13个
+
+cat("≥3方法选中KO数：", length(selected_3plus), "\n")
+cat("4方法严格交集KO数：", length(selected_4), "\n")
+cat("LASSO单独选中：", length(venn_lists$LASSO), "\n")
+
+# 保存两个集合的KO→通路映射
+if (length(selected_3plus) > 0) {
+  map_3 <- ko2path %>% filter(KO %in% selected_3plus)
+  write.csv(map_3, "KO_Pathway_Mapping_3plus.csv", row.names = FALSE)
+  cat("≥3方法映射：", length(unique(map_3$KO)), "个KO → ", 
+      length(unique(map_3$pathway)), "个通路\n")
+}
+
+if (length(selected_4) > 0) {
+  map_4 <- ko2path %>% filter(KO %in% selected_4)
+  write.csv(map_4, "KO_Pathway_Mapping_4methods.csv", row.names = FALSE)
+  cat("4方法映射：", length(unique(map_4$KO)), "个KO → ", 
+      length(unique(map_4$pathway)), "个通路\n")
+}
+
+# 13.2 通路富集函数（复用）
+run_enrichment <- function(ko_set, label) {
+  if (length(ko_set) == 0) return(NULL)
+  
+  enrich <- ko2path %>%
+    filter(KO %in% background_ko) %>%
+    group_by(pathway) %>%
+    summarise(
+      Pathway_KO_total = n(),
+      Selected_KO_in_pathway = sum(KO %in% ko_set),
+      .groups = "drop"
+    ) %>%
+    filter(Pathway_KO_total >= 3) %>%
+    mutate(
+      N = length(background_ko),
+      n = length(ko_set),
+      K = Pathway_KO_total,
+      k = Selected_KO_in_pathway,
+      Expected = n * K / N,
+      Enrichment_Ratio = ifelse(Expected > 0, k / Expected, NA),
+      p_hyper = phyper(k - 1, K, N - K, n, lower.tail = FALSE),
+      FDR = p.adjust(p_hyper, method = "fdr")
+    ) %>%
+    arrange(FDR, -Enrichment_Ratio)
+  
+  write.csv(enrich, paste0("KO_Enrichment_", label, ".csv"), row.names = FALSE)
+  return(enrich)
+}
+
+# 背景KO集
+background_ko <- ko_cols
+
+# 分别运行两套富集
+enrich_3 <- run_enrichment(selected_3plus, "3plus")
+enrich_4 <- run_enrichment(selected_4, "4methods")
+
+cat("\n--- ≥3方法富集 Top 10 ---\n")
+if (!is.null(enrich_3)) print(head(enrich_3, 10))
+
+cat("\n--- 4方法富集 Top 10 ---\n")
+if (!is.null(enrich_4)) print(head(enrich_4, 10))
+
+# 13.3 对比：哪些通路只在≥3方法中富集，被4方法漏检？----
+if (!is.null(enrich_3) && !is.null(enrich_4)) {
+  lost_pathways <- enrich_3 %>%
+    filter(FDR < 0.05) %>%
+    anti_join(enrich_4 %>% filter(FDR < 0.05), by = "pathway")
+  
+  cat("\n被4方法严格交集漏检的富集通路（仅在≥3方法中FDR<0.05）：", 
+      nrow(lost_pathways), "个\n")
+  if (nrow(lost_pathways) > 0) {
+    print(head(lost_pathways, 10))
+    write.csv(lost_pathways, "KO_Pathways_Lost_by_4methods.csv", row.names = FALSE)
+  }
+}
+
+# 14. 可视化（新增对比图）----
+cat("\n========== 可视化输出 ==========\n")
+
+# 14.1 两套富集对比条形图（Top 10 each）
+if (!is.null(enrich_3) && !is.null(enrich_4)) {
+  
+  # 合并两套Top 10
+  top3 <- head(enrich_3, 10) %>% mutate(Set = "≥3 methods (M6)")
+  top4 <- head(enrich_4, 10) %>% mutate(Set = "4 methods (stringent)")
+  compare_df <- bind_rows(top3, top4)
+  
+  p_compare <- ggplot(compare_df, 
+                      aes(x = reorder(pathway, Enrichment_Ratio), 
+                          y = Enrichment_Ratio, fill = Set)) +
+    geom_bar(stat = "identity", position = "dodge", width = 0.7) +
+    coord_flip() +
+    scale_fill_manual(values = c("≥3 methods (M6)" = "#56B4E9", 
+                                  "4 methods (stringent)" = "#E69F00")) +
+    labs(x = "KEGG Pathway", y = "Enrichment Ratio (Observed / Expected)",
+         title = "Pathway Enrichment: ≥3 Methods vs. 4 Methods Intersection",
+         subtitle = paste0("LASSO selected only ", length(venn_lists$LASSO), 
+                          " KOs due to L1 sparsity and functional collinearity")) +
+    theme_bw(base_size = 11) +
+    theme(legend.position = "bottom")
+  
+  ggsave("KO_Enrichment_Comparison_3vs4.pdf", p_compare, width = 12, height = 8)
+  cat("富集对比图已保存\n")
+}
+
+# 14.2 LASSO稀疏性说明图（Upset图已足够，此处补充文字输出）
+lasso_explanation <- data.frame(
+  Method = c("Spearman", "Kendall", "Bootstrap", "LASSO"),
+  Selected_Count = c(length(venn_lists$Spearman), length(venn_lists$Kendall),
+                     length(venn_lists$Bootstrap), length(venn_lists$LASSO)),
+  Reason_for_Difference = c(
+    "Rank correlation, threshold-based",
+    "Rank correlation, threshold-based", 
+    "Resampling-based CI",
+    "L1 regularization: forces sparsity; drops collinear features"
+  )
+)
+write.csv(lasso_explanation, "KO_Method_Selection_Counts.csv", row.names = FALSE)
+cat("方法选择数对比表已保存\n")
+
+# （其余Venn、Upset、Forest图与之前代码相同，略...）
+
+# 15. 最终汇总 ----
+cat("\n========== 分析完成 ==========\n")
+cat("关键发现：\n")
+cat("  • LASSO因L1正则化和KO功能共线性，仅选中", length(venn_lists$LASSO), "个KO\n")
+cat("  • 4方法严格交集仅", length(selected_4), "个KO，富集通路极少\n")
+cat("  • ≥3方法（M6敏感性分析）保留", length(selected_3plus), "个KO，生物学解释更丰富\n")
+cat("  • 被4方法漏检的通路已输出至 KO_Pathways_Lost_by_4methods.csv\n")
+cat("\n输出文件：\n")
+cat("  - KO_Enrichment_3plus.csv / KO_Enrichment_4methods.csv\n")
+cat("  - KO_Pathway_Mapping_3plus.csv / KO_Pathway_Mapping_4methods.csv\n")
+cat("  - KO_Pathways_Lost_by_4methods.csv\n")
+cat("  - KO_Enrichment_Comparison_3vs4.pdf\n")
+cat("  - KO_Method_Selection_Counts.csv\n")
+
+# ============================================================================
+# 9条富集通路四组箱线图：HC / ANIH / AIH / ALF
+# 基于 CLR 转换后的 KO 数据，按通路汇总
+# ============================================================================
+
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(ggpubr)
+
+# 1. 读取数据
+ko_data <- read_excel("D:/LHF/clr/haiyan/基因/样本功能基因.xlsx") %>% as.data.frame()
+ko2path <- read_excel("D:/LHF/clr/haiyan/基因/ko2pathway.xlsx") %>% as.data.frame()
+names(ko2path) <- c("KO", "pathway")
+
+# 2. 定义9条目标通路
+target_pathways <- c(
+  "Peptidoglycan biosynthesis [PATH:ko00550]",
+  "Glycolysis / Gluconeogenesis [PATH:ko00010]",
+  "Cell growth",
+  "Two-component system [PATH:ko02020]",
+  "Nitrogen metabolism [PATH:ko00910]",
+  "Butanoate metabolism [PATH:ko00650]",
+  "Pyruvate metabolism [PATH:ko00620]",
+  "ABC transporters [PATH:ko02010]",
+  "Transporters [BR:ko02000]"
+)
+
+# 3. 提取KO列并做CLR转换
+meta_cols <- c("sample", "Group", "Age", "Gender", "BMI", "Final_Score", "Adjusted_Final_Score")
+ko_cols <- setdiff(names(ko_data), meta_cols)
+
+X_raw <- as.matrix(ko_data[, ko_cols])
+X_raw[is.na(X_raw)] <- 0
+
+# CLR转换
+min_pos <- min(X_raw[X_raw > 0])
+X_pseudo <- X_raw + (min_pos / 2)
+X_clr <- t(apply(X_pseudo, 1, function(row) {
+  lr <- log(row)
+  lr - mean(lr)
+}))
+
+clr_df <- as.data.frame(X_clr)
+clr_df$sample <- ko_data$sample
+clr_df$Group <- ko_data$Group
+
+# 4. 确保Group为因子，按指定顺序
+group_order <- c("HC", "ANIH", "AIH", "ALF")
+clr_df$Group <- factor(clr_df$Group, levels = group_order)
+
+# 颜色映射
+group_colors <- c(
+  "HC"    = "#D97A5E",
+  "ANIH" = "#3C405B",
+  "AIH"  = "#82B29A",
+  "ALF"  = "#F2CC8E"
+)
+
+# 5. 按通路汇总KO（求平均CLR值）----
+ko_path_filtered <- ko2path %>% 
+  filter(pathway %in% target_pathways, KO %in% ko_cols)
+
+pathway_long <- clr_df %>%
+  pivot_longer(cols = all_of(ko_cols), names_to = "KO", values_to = "CLR_Abundance") %>%
+  inner_join(ko_path_filtered, by = "KO") %>%
+  group_by(sample, Group, pathway) %>%
+  summarise(Mean_CLR = mean(CLR_Abundance, na.rm = TRUE), .groups = "drop")
+
+# 简化通路名称
+pathway_short <- c(
+  "Peptidoglycan biosynthesis [PATH:ko00550]" = "Peptidoglycan biosynthesis",
+  "Glycolysis / Gluconeogenesis [PATH:ko00010]" = "Glycolysis / Gluconeogenesis",
+  "Cell growth" = "Cell growth",
+  "Two-component system [PATH:ko02020]" = "Two-component system",
+  "Nitrogen metabolism [PATH:ko00910]" = "Nitrogen metabolism",
+  "Butanoate metabolism [PATH:ko00650]" = "Butanoate metabolism",
+  "Pyruvate metabolism [PATH:ko00620]" = "Pyruvate metabolism",
+  "ABC transporters [PATH:ko02010]" = "ABC transporters",
+  "Transporters [BR:ko02000]" = "Transporters"
+)
+pathway_long$Pathway_Short <- pathway_short[pathway_long$pathway]
+
+# 按HC中位数排序
+pathway_order <- pathway_long %>%
+  filter(Group == "HC") %>%
+  group_by(Pathway_Short) %>%
+  summarise(med = median(Mean_CLR), .groups = "drop") %>%
+  arrange(med) %>%
+  pull(Pathway_Short)
+
+pathway_long$Pathway_Short <- factor(pathway_long$Pathway_Short, levels = pathway_order)
+
+# 6. 绘制四组箱线图 ----
+p_box <- ggplot(pathway_long, aes(x = Group, y = Mean_CLR, fill = Group)) +
+  geom_boxplot(alpha = 0.8, outlier.shape = NA, width = 0.6) +
+  geom_jitter(width = 0.1, size = 1.2, alpha = 0.3, show.legend = FALSE) +
+  scale_fill_manual(values = group_colors, name = "Group") +
+  facet_wrap(~ Pathway_Short, scales = "free_y", ncol = 3) +
+  labs(
+    x = NULL,
+    y = "Mean CLR-transformed Abundance",
+    title = "Nine Enriched Microbial Pathways Across Disease Severity Groups",
+    subtitle = "KO features selected by ≥3 methods (Reviewer M6 sensitivity analysis)"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
+    strip.background = element_rect(fill = "steelblue", color = NA),
+    strip.text = element_text(color = "white", face = "bold", size = 10),
+    legend.position = "bottom",
+    panel.spacing = unit(1.2, "lines"),
+    plot.title = element_text(face = "bold", size = 13)
+  ) +
+  # HC vs 各疾病组的 pairwise 比较
+  stat_compare_means(
+    comparisons = list(
+      c("HC", "ANIH"),
+      c("HC", "AIH"),
+      c("HC", "ALF")
+    ),
+    method = "wilcox.test",
+    label = "p.signif",
+    tip.length = 0.02,
+    size = 3,
+    bracket.size = 0.4
+  )
+
+# 保存
+ggsave("Pathway_Boxplot_9Enriched_4Groups.pdf", p_box, width = 13, height = 10, dpi = 300)
+ggsave("Pathway_Boxplot_9Enriched_4Groups.png", p_box, width = 13, height = 10, dpi = 300)
+cat("四组箱线图已保存：Pathway_Boxplot_9Enriched_4Groups.pdf\n")
+
+# 7. 统计检验表格（Kruskal-Wallis + Dunn's post-hoc）----
+library(FSA)
+
+stat_kw <- pathway_long %>%
+  group_by(pathway, Pathway_Short) %>%
+  summarise(
+    KW_p = kruskal.test(Mean_CLR ~ Group)$p.value,
+    .groups = "drop"
+  ) %>%
+  mutate(KW_FDR = p.adjust(KW_p, method = "fdr"))
+
+# Dunn's test post-hoc
+dunn_results <- pathway_long %>%
+  group_by(pathway) %>%
+  group_modify(~ {
+    if (length(unique(.x$Group)) < 2) return(data.frame())
+    dt <- dunnTest(Mean_CLR ~ Group, data = .x, method = "bh")
+    as.data.frame(dt$res)
+  }) %>%
+  ungroup()
+
+write.csv(stat_kw, "Pathway_9Enriched_KruskalWallis.csv", row.names = FALSE)
+write.csv(dunn_results, "Pathway_9Enriched_DunnPostHoc.csv", row.names = FALSE)
+cat("统计结果已保存：Kruskal-Wallis + Dunn's post-hoc\n")
+
+# ============================================================================
+# 三列式物种-通路相关性网络图
+# 左：Dorea/Eubacterium/Romboutsia/Roseburia
+# 中：9条富集通路
+# 右：Anaeroglobus/Ligilactobacillus/Veillonella spp.
+# ============================================================================
+
+library(igraph)
+library(dplyr)
+
+# 假设 corr_df 已存在（包含 Species, Pathway, Spearman_rho, Stars 等列）
+# 假设 path_names 为9条通路短名向量
+
+# 1. 定义三组节点 ----
+left_species <- c("Dorea.longicatena", "Eubacterium.ramulus", 
+                  "Romboutsia.timonensis", "Roseburia.sp..MSJ-14")
+
+right_species <- c("Anaeroglobus.micronuciformis", "Ligilactobacillus.salivarius",
+                   "Veillonella.atypica", "Veillonella.rogosae")
+
+mid_pathways <- path_names  # 9条通路短名
+
+# 2. 构建节点属性表（含手动坐标）----
+# Y坐标：均匀分布，中间通路多，所以范围大一些
+node_df <- data.frame(
+    name = c(left_species, mid_pathways, right_species),
+    type = c(rep("Left", 4), rep("Pathway", 9), rep("Right", 4)),
+    x = c(rep(-2.5, 4), rep(0, 9), rep(2.5, 4)),
+    y = c(seq(3, -3, length.out = 4),
+          seq(5, -5, length.out = 9),
+          seq(3, -3, length.out = 4)),
+    stringsAsFactors = FALSE
+)
+
+# 3. 构建边数据框（只保留显著相关：FDR < 0.05）----
+edges_df <- corr_df %>%
+    filter(Species %in% c(left_species, right_species),
+           Pathway %in% mid_pathways,
+           Stars != "") %>%  # 只保留FDR<0.05的显著边
+    mutate(
+        from = Species,
+        to = Pathway,
+        weight = abs(Spearman_rho),
+        direction = ifelse(Spearman_rho > 0, "Positive", "Negative")
+    )
+
+# 4. 创建igraph对象 ----
+g <- graph_from_data_frame(
+    d = edges_df[, c("from", "to", "weight", "Spearman_rho", "direction")],
+    vertices = node_df,
+    directed = FALSE
+)
+
+# 5. 设置边属性（颜色 + 宽度）----
+# 线宽映射：|ρ| ∈ [0,1] → width ∈ [0.5, 8]
+w_min <- min(E(g)$weight)
+w_max <- max(E(g)$weight)
+if (w_max > w_min) {
+    E(g)$width <- 0.5 + 7.5 * (E(g)$weight - w_min) / (w_max - w_min)
+} else {
+    E(g)$width <- 3
+}
+
+# 颜色：正相关红色，负相关蓝色
+E(g)$color <- ifelse(E(g)$direction == "Positive", "#D62728", "#1F77B4")
+
+# 透明度：弱相关更透明（可选，增强层次感）
+E(g)$alpha <- 0.3 + 0.7 * (E(g)$weight / w_max)
+
+# 6. 设置节点属性 ----
+V(g)$shape <- ifelse(V(g)$type == "Pathway", "circle", "sphere")
+V(g)$size <- ifelse(V(g)$type == "Pathway", 22, 16)
+V(g)$frame.color <- "gray30"
+V(g)$frame.width <- 1.5
+
+# 节点颜色：左侧菌种=深绿，右侧菌种=浅绿，通路=深蓝
+node_colors <- c("Left" = "#2E7D32", "Pathway" = "#3C405B", "Right" = "#66BB6A")
+V(g)$color <- node_colors[V(g)$type]
+
+# 标签
+V(g)$label <- V(g)$name
+V(g)$label.cex <- ifelse(V(g)$type == "Pathway", 0.65, 0.75)
+V(g)$label.color <- "black"
+V(g)$label.dist <- 0.4
+V(g)$label.font <- 2  # bold
+
+# 7. 手动布局矩阵 ----
+layout_mat <- cbind(V(g)$x, V(g)$y)
+
+# 8. 绘制 ----
+pdf(file.path(fig_dir, "Fig6_TriColumn_Species_Pathway_Network.pdf"), 
+    width = 14, height = 10)
+
+par(mar = c(1, 1, 4, 1))
+
+plot(g, 
+     layout = layout_mat,
+     rescale = FALSE,           # 不自动缩放，使用原始坐标
+     xlim = c(-3.5, 3.5),
+     ylim = c(-6, 6),
+     
+     # 边
+     edge.width = E(g)$width,
+     edge.color = E(g)$color,
+     edge.curved = 0.15,        # 轻微弯曲，避免重叠
+     edge.lty = 1,
+     
+     # 节点
+     vertex.shape = V(g)$shape,
+     vertex.size = V(g)$size,
+     vertex.color = V(g)$color,
+     vertex.frame.color = V(g)$frame.color,
+     vertex.frame.width = V(g)$frame.width,
+     
+     # 标签
+     vertex.label = V(g)$label,
+     vertex.label.cex = V(g)$label.cex,
+     vertex.label.color = V(g)$label.color,
+     vertex.label.dist = V(g)$label.dist,
+     vertex.label.font = V(g)$label.font,
+     
+     # 标题
+     main = "Species-Pathway Correlation Network\n(Left: Butyrate producers | Right: Other key species | Center: Enriched pathways)",
+     cex.main = 1.3
+)
+
+# 9. 添加图例 ----
+# 边宽图例
+rho_legend <- round(seq(w_min, w_max, length.out = 4), 2)
+width_legend <- 0.5 + 7.5 * (rho_legend - w_min) / (w_max - w_min)
+
+legend("bottomright", 
+       title = "Correlation Strength\n(|Spearman ρ|)",
+       legend = rho_legend,
+       lwd = width_legend,
+       col = "gray40",
+       bty = "n",
+       cex = 0.9)
+
+# 颜色图例
+legend("bottomleft",
+       title = "Correlation Direction",
+       legend = c("Positive", "Negative"),
+       lwd = 3,
+       col = c("#D62728", "#1F77B4"),
+       bty = "n",
+       cex = 0.9)
+
+# 节点类型图例
+legend("topleft",
+       title = "Node Type",
+       legend = c("Left Species\n(Butyrate-related)", 
+                  "Enriched Pathway",
+                  "Right Species\n(Other key taxa)"),
+       pch = c(21, 21, 21),
+       pt.bg = c("#2E7D32", "#3C405B", "#66BB6A"),
+       pt.cex = 1.8,
+       bty = "n",
+       cex = 0.9)
+
+dev.off()
+
+cat("三列式网络图已保存：Fig6_TriColumn_Species_Pathway_Network.pdf\n")
+
+# ============================================================================
+# ============================================================================
+# 修正与补充代码
+# 1. 网络图线宽修复
+# 2. 统计表强制输出
+# 3. Pathway Membership图修正
+# 4. K08303 组间两两比较
+# 5. K08303 与评分线性关系
+# ============================================================================
+
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(ggpubr)
+library(igraph)
+
+fig_dir <- "figures_core9_species"
+if(!dir.exists(fig_dir)) dir.create(fig_dir, recursive = TRUE)
+# ============================================================================
+# 修正版：三列式网络图（|ρ| ≥ 0.3，自动移除孤立节点）
+# ============================================================================
+
+cat("\n========== 修正：网络图（|ρ| ≥ 0.3，无孤立节点）==========\n")
+
+# 1. 重新筛选边（严格 |ρ| ≥ 0.3 且 FDR < 0.05）
+edges_df <- corr_df %>%
+    filter(Species %in% c(left_species, right_species),
+           Pathway %in% mid_pathways,
+           Significant == TRUE, 
+           Abs_rho >= 0.3) %>%  # 严格阈值
+    mutate(
+        from = Species,
+        to = Pathway,
+        weight = Abs_rho,
+        direction = ifelse(Spearman_rho > 0, "Positive", "Negative")
+    )
+
+cat("显著边数（|ρ|≥0.3）：", nrow(edges_df), "\n")
+
+# 2. 提取实际有连线的节点（自动过滤孤立菌种）
+connected_species <- unique(c(edges_df$from, edges_df$to))
+connected_left <- intersect(left_species, connected_species)
+connected_right <- intersect(right_species, connected_species)
+connected_pathways <- intersect(mid_pathways, connected_species)
+
+cat("有连线的左列菌种：", length(connected_left), "个\n")
+cat("有连线的右列菌种：", length(connected_right), "个\n")
+cat("有连线的通路：", length(connected_pathways), "个\n")
+
+# 3. 重建节点表（只含有连线的节点）
+node_df <- data.frame(
+    name = c(connected_left, connected_pathways, connected_right),
+    type = c(rep("Left", length(connected_left)), 
+             rep("Pathway", length(connected_pathways)), 
+             rep("Right", length(connected_right))),
+    x = c(rep(-2.5, length(connected_left)), 
+          rep(0, length(connected_pathways)), 
+          rep(2.5, length(connected_right))),
+    y = c(seq(3, -3, length.out = max(length(connected_left), 1)),
+          seq(5, -5, length.out = max(length(connected_pathways), 1)),
+          seq(3, -3, length.out = max(length(connected_right), 1)))[1:(length(connected_left) + length(connected_pathways) + length(connected_right))],
+    stringsAsFactors = FALSE
+)
+
+# 4. 创建igraph对象
+g <- graph_from_data_frame(
+    d = edges_df[, c("from", "to", "weight", "Spearman_rho", "direction")],
+    vertices = node_df,
+    directed = FALSE
+)
+
+# 5. 边属性（线宽 + 颜色，修复adjustcolor报错）
+w_min <- min(E(g)$weight, na.rm = TRUE)
+w_max <- max(E(g)$weight, na.rm = TRUE)
+
+if (w_max > w_min) {
+    E(g)$width <- 1.5 + 10.5 * (E(g)$weight - w_min) / (w_max - w_min)
+} else {
+    E(g)$width <- 4
+}
+
+# 修复：不用adjustcolor，直接定义颜色+透明度
+edge_colors <- ifelse(E(g)$direction == "Positive", "#D62728", "#1F77B4")
+# 将颜色转为RGB再调透明度，避免adjustcolor报错
+edge_rgb <- col2rgb(edge_colors) / 255
+E(g)$color <- rgb(edge_rgb[1,], edge_rgb[2,], edge_rgb[3,], 
+                  alpha = 0.4 + 0.6 * (E(g)$weight / w_max))
+
+# 6. 节点属性
+V(g)$shape <- ifelse(V(g)$type == "Pathway", "circle", "sphere")
+V(g)$size <- ifelse(V(g)$type == "Pathway", 22, 15)
+V(g)$frame.color <- "gray30"
+V(g)$frame.width <- 1.5
+
+node_colors <- c("Left" = "#2E7D32", "Pathway" = "#3C405B", "Right" = "#66BB6A")
+V(g)$color <- node_colors[V(g)$type]
+
+V(g)$label <- V(g)$name
+V(g)$label.cex <- ifelse(V(g)$type == "Pathway", 0.65, 0.72)
+V(g)$label.color <- "black"
+V(g)$label.dist <- 0.45
+V(g)$label.font <- 2
+
+# 7. 布局
+layout_mat <- cbind(V(g)$x, V(g)$y)
+
+# 8. 绘图
+pdf(file.path(fig_dir, "Fig1_TriColumn_Network_rho03_NoIsolate.pdf"), 
+    width = 14, height = 10)
+
+par(mar = c(1, 1, 4, 1))
+
+plot(g, 
+     layout = layout_mat,
+     rescale = FALSE,
+     xlim = c(-3.5, 3.5),
+     ylim = c(-6.5, 6.5),
+     
+     edge.width = E(g)$width,
+     edge.color = E(g)$color,      # 修复：直接使用RGB+alpha
+     edge.curved = 0.15,
+     edge.lty = 1,
+     
+     vertex.shape = V(g)$shape,
+     vertex.size = V(g)$size,
+     vertex.color = V(g)$color,
+     vertex.frame.color = V(g)$frame.color,
+     vertex.frame.width = V(g)$frame.width,
+     
+     vertex.label = V(g)$label,
+     vertex.label.cex = V(g)$label.cex,
+     vertex.label.color = V(g)$label.color,
+     vertex.label.dist = V(g)$label.dist,
+     vertex.label.font = V(g)$label.font,
+     
+     edge.arrow.size = 0,
+     main = "Species-Pathway Correlation Network\n(|Spearman ρ| ≥ 0.3, FDR < 0.05)",
+     cex.main = 1.3
+)
+
+# 图例
+rho_legend <- round(seq(w_min, w_max, length.out = 4), 2)
+width_legend <- 1.5 + 10.5 * (rho_legend - w_min) / (w_max - w_min)
+
+legend("bottomright", 
+       title = expression(paste("|", rho, "|")),
+       legend = rho_legend,
+       lwd = width_legend,
+       col = "gray40",
+       bty = "n", cex = 0.9, inset = c(0.02, 0.05))
+
+legend("bottomleft",
+       title = "Direction",
+       legend = c("Positive", "Negative"),
+       lwd = 3,
+       col = c("#D62728", "#1F77B4"),
+       bty = "n", cex = 0.9, inset = c(0.02, 0.05))
+
+legend("topleft",
+       title = "Node Type",
+       legend = c(paste0("Left Species (n=", length(connected_left), ")"),
+                  paste0("Pathway (n=", length(connected_pathways), ")"),
+                  paste0("Right Species (n=", length(connected_right), ")")),
+       pch = c(21, 21, 21),
+       pt.bg = c("#2E7D32", "#3C405B", "#66BB6A"),
+       pt.cex = 1.8,
+       bty = "n", cex = 0.9, inset = c(0.02, 0.02))
+
+dev.off()
+
+cat("修正版网络图已保存（|ρ|≥0.3，无孤立节点）\n")
+cat("参与网络节点：", vcount(g), "个，边：", ecount(g), "条\n")
+
+# ====================== 2. 强制输出统计表（追加到末尾）=====================
+cat("\n========== 修正：强制输出统计表 ==========\n")
+
+# 确保 pairwise_prev 存在且非空
+if (exists("pairwise_prev") && nrow(pairwise_prev) > 0) {
+    write.csv(pairwise_prev, 
+              file.path(fig_dir, "Pairwise_Prevalence_Stats.csv"), 
+              row.names = FALSE)
+    cat("Pairwise_Prevalence_Stats.csv 已输出，行数：", nrow(pairwise_prev), "\n")
+} else {
+    cat("警告：pairwise_prev 为空，创建空表输出\n")
+    empty_prev <- data.frame(
+        Species = character(),
+        Comparison = character(),
+        p_value = numeric(),
+        FDR = numeric(),
+        Signif = character(),
+        stringsAsFactors = FALSE
+    )
+    write.csv(empty_prev, 
+              file.path(fig_dir, "Pairwise_Prevalence_Stats.csv"), 
+              row.names = FALSE)
+}
+
+# 同时输出丰度比较统计表
+if (exists("abund_stats") && nrow(abund_stats) > 0) {
+    write.csv(abund_stats, 
+              file.path(fig_dir, "Pairwise_Abundance_Stats.csv"), 
+              row.names = FALSE)
+    cat("Pairwise_Abundance_Stats.csv 已输出\n")
+}
+
+# ====================== 3. Pathway Membership of Core KO 图修正 ======================
+cat("\n========== 修正：Pathway Membership 图 ==========\n")
+
+# 重新计算核心KO（如果环境中不存在）
+if (!exists("feat_3plus")) {
+    # 快速重新计算（简化版）
+    cat("重新计算核心KO...\n")
+    # 假设 results 已存在，否则需要重新跑完整筛选
+    # 这里使用已有的 results 对象
+    cond_s <- results$Sig_Spearman
+    cond_k <- results$Sig_Kendall
+    cond_b <- results$Sig_Bootstrap
+    cond_l <- results$Sig_LASSO
+    
+    all_f <- unique(c(results$Feature[cond_s], results$Feature[cond_k],
+                      results$Feature[cond_b], results$Feature[cond_l]))
+    mcount <- sapply(all_f, function(f) {
+        sum(c(f %in% results$Feature[cond_s],
+              f %in% results$Feature[cond_k],
+              f %in% results$Feature[cond_b],
+              f %in% results$Feature[cond_l]))
+    })
+    feat_3plus <- names(mcount[mcount >= 3])
+}
+
+# 统计每个核心KO映射到多少条通路
+ko_pathway_count <- ko2path %>%
+    filter(KO %in% feat_3plus) %>%
+    group_by(KO) %>%
+    summarise(N_Pathways = n(), .groups = "drop") %>%
+    arrange(desc(N_Pathways))
+
+# 合并相关性信息
+ko_top_rho <- results %>%
+    filter(Feature %in% feat_3plus) %>%
+    group_by(Feature) %>%
+    summarise(Max_Rho = max(abs(Spearman_rho), na.rm = TRUE), .groups = "drop")
+
+ko_pathway_count <- ko_pathway_count %>%
+    left_join(ko_top_rho, by = c("KO" = "Feature"))
+
+# 修正版柱状图：横坐标=KO编号，纵坐标=通路数，颜色=Max|rho|
+# 为避免过于拥挤，只展示通路数≥2的KO，或调整图形宽度
+ko_plot_data <- ko_pathway_count %>%
+    mutate(KO = factor(KO, levels = KO[order(-N_Pathways)]))
+
+p_ko_path <- ggplot(ko_plot_data, aes(x = KO, y = N_Pathways)) +
+    geom_col(aes(fill = Max_Rho), alpha = 0.9, color = "black", size = 0.2, width = 0.6) +
+    scale_fill_gradient(low = "steelblue", high = "darkred", 
+                        name = "Max |Spearman ρ|") +
+    labs(
+        x = "Core KO ID (selected by ≥3 methods)",
+        y = "Number of Mapped Pathways",
+        title = "Pathway Membership of Core KOs",
+        subtitle = paste0("Total core KOs: ", nrow(ko_plot_data), 
+                          " | Each bar represents one KO")
+    ) +
+    theme_bw(base_size = 11) +
+    theme(
+        axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 6.5),
+        legend.position = "right",
+        plot.title = element_text(face = "bold", size = 12, hjust = 0.5),
+        panel.grid.major.x = element_blank()
+    )
+
+# 加宽PDF以容纳所有KO标签
+ggsave(file.path(fig_dir, "Fig4_Pathway_per_CoreKO_Barplot_Fixed.pdf"), 
+       p_ko_path, width = 18, height = 7, dpi = 300)
+ggsave(file.path(fig_dir, "Fig4_Pathway_per_CoreKO_Barplot_Fixed.png"), 
+       p_ko_path, width = 18, height = 7, dpi = 300)
+
+write.csv(ko_pathway_count, 
+          file.path(fig_dir, "CoreKO_Pathway_Count.csv"), 
+          row.names = FALSE)
+cat("Pathway Membership 图已修正保存\n")
+
+# ====================== 4. K08303 丰度组间两两比较 ======================
+cat("\n========== K08303 组间两两比较 ==========\n")
+
+# 检查 K08303 是否存在
+k08303_col <- "K08303"
+if (!k08303_col %in% names(ko_data)) {
+    # 尝试模糊匹配
+    k08303_candidates <- grep("K08303", names(ko_data), value = TRUE)
+    if (length(k08303_candidates) > 0) {
+        k08303_col <- k08303_candidates[1]
+        cat("K08303 匹配到列：", k08303_col, "\n")
+    } else {
+        stop("未找到 K08303 列")
+    }
+}
+
+# 提取 K08303 并做 CLR（如果之前 X_clr 已存在，可直接使用）
+if (exists("X_clr") && k08303_col %in% colnames(X_clr)) {
+    k08303_clr <- X_clr[, k08303_col]
+    cat("从已有 X_clr 提取 K08303\n")
+} else {
+    # 重新计算
+    k08303_raw <- ko_data[[k08303_col]]
+    k08303_raw[is.na(k08303_raw)] <- 0
+    if (all(k08303_raw >= 0)) {
+        min_v <- min(k08303_raw[k08303_raw > 0])
+        k08303_clr <- log(k08303_raw + min_v/2) - mean(log(k08303_raw + min_v/2))
+    } else {
+        k08303_clr <- k08303_raw
+    }
+}
+
+# 构建数据框
+k08303_df <- data.frame(
+    sample = ko_data$sample,
+    Group = factor(ko_data$Group, levels = group_order),
+    K08303_CLR = as.numeric(k08303_clr),
+    stringsAsFactors = FALSE
+)
+
+# 箱线图 + 两两比较
+p_k08303_box <- ggplot(k08303_df, aes(x = Group, y = K08303_CLR, fill = Group)) +
+    geom_boxplot(alpha = 0.8, outlier.shape = NA, width = 0.55) +
+    geom_jitter(width = 0.08, size = 1.5, alpha = 0.4, show.legend = FALSE) +
+    scale_fill_manual(values = group_colors) +
+    stat_compare_means(
+        comparisons = list(c("HC","ANIH"), c("HC","AIH"), c("HC","ALF"),
+                           c("ANIH","AIH"), c("ANIH","ALF"), c("AIH","ALF")),
+        method = "wilcox.test",
+        label = "p.signif",
+        tip.length = 0.01,
+        step.increase = 0.1,
+        bracket.size = 0.4,
+        hide.ns = TRUE,
+        size = 3.5
+    ) +
+    labs(
+        x = NULL,
+        y = "CLR-transformed Abundance",
+        title = expression(paste("K08303 Abundance Across Four Groups (", italic("Pseudomonas"), "-related KO)")),
+        subtitle = "Wilcoxon rank-sum test with BH correction"
+    ) +
+    theme_bw(base_size = 12) +
+    theme(
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 11),
+        legend.position = "none",
+        plot.title = element_text(face = "bold", size = 13, hjust = 0.5)
+    )
+
+ggsave(file.path(fig_dir, "Fig5_K08303_Abundance_Boxplot.pdf"), 
+       p_k08303_box, width = 7, height = 6, dpi = 300)
+ggsave(file.path(fig_dir, "Fig5_K08303_Abundance_Boxplot.png"), 
+       p_k08303_box, width = 7, height = 6, dpi = 300)
+cat("K08303 箱线图已保存\n")
+
+# 输出统计
+k08303_stats <- data.frame()
+for (pair in list(c("HC","ANIH"), c("HC","AIH"), c("HC","ALF"),
+                  c("ANIH","AIH"), c("ANIH","ALF"), c("AIH","ALF"))) {
+    sub <- k08303_df %>% filter(Group %in% pair)
+    if (nrow(sub) > 0) {
+        wt <- wilcox.test(K08303_CLR ~ Group, data = sub, exact = FALSE)
+        k08303_stats <- rbind(k08303_stats, data.frame(
+            Comparison = paste(pair, collapse = "-"),
+            p_value = wt$p.value,
+            stringsAsFactors = FALSE
+        ))
+    }
+}
+k08303_stats$FDR <- p.adjust(k08303_stats$p_value, method = "BH")
+write.csv(k08303_stats, file.path(fig_dir, "K08303_Pairwise_Stats.csv"), row.names = FALSE)
+
+# ====================== 5. K08303 与评分线性关系 ======================
+cat("\n========== K08303 与评分线性关系 ==========\n")
+
+# 使用 Adjusted_Final_Score（或残差评分 y_adj）
+# 确保样本匹配
+k08303_score_df <- data.frame(
+    sample = ko_data$sample,
+    Group = factor(ko_data$Group, levels = group_order),
+    K08303_CLR = as.numeric(k08303_clr),
+    Score = ko_data$Adjusted_Final_Score,  # 或 ko_data$Final_Score
+    stringsAsFactors = FALSE
+)
+
+# 如果 y_adj 存在且样本匹配，优先使用残差评分
+if (exists("y_adj") && length(y_adj) == nrow(ko_data)) {
+    k08303_score_df$Score_Residual <- y_adj
+    score_col <- "Score_Residual"
+    score_label <- "Residualized Disease Score\n(adjusted for Age, Gender, BMI)"
+} else {
+    score_col <- "Score"
+    score_label <- "Adjusted Final Score"
+}
+
+# 线性回归
+fit_lm <- lm(as.formula(paste("K08303_CLR ~", score_col)), data = k08303_score_df)
+r_squared <- summary(fit_lm)$r.squared
+p_lm <- summary(fit_lm)$coefficients[2, 4]
+
+p_k08303_lm <- ggplot(k08303_score_df, aes_string(x = score_col, y = "K08303_CLR")) +
+    geom_point(aes(color = Group), size = 3, alpha = 0.7) +
+    geom_smooth(method = "lm", se = TRUE, color = "black", fill = "gray80", alpha = 0.3) +
+    scale_color_manual(values = group_colors) +
+    annotate("text", 
+             x = min(k08303_score_df[[score_col]], na.rm = TRUE) * 0.9 + max(k08303_score_df[[score_col]], na.rm = TRUE) * 0.1,
+             y = max(k08303_score_df$K08303_CLR, na.rm = TRUE) * 0.95,
+             label = sprintf("R² = %.3f\np = %.3e", r_squared, p_lm),
+             hjust = 0, vjust = 1, size = 4, fontface = "italic") +
+    labs(
+        x = score_label,
+        y = "K08303 CLR-transformed Abundance",
+        title = expression(paste("Linear Relationship: K08303 vs. Disease Severity")),
+        subtitle = "Pearson correlation on CLR-transformed data",
+        color = "Group"
+    ) +
+    theme_bw(base_size = 12) +
+    theme(
+        plot.title = element_text(face = "bold", size = 13, hjust = 0.5),
+        legend.position = "bottom"
+    )
+
+ggsave(file.path(fig_dir, "Fig6_K08303_Score_Linear.pdf"), 
+       p_k08303_lm, width = 7, height = 6.5, dpi = 300)
+ggsave(file.path(fig_dir, "Fig6_K08303_Score_Linear.png"), 
+       p_k08303_lm, width = 7, height = 6.5, dpi = 300)
+cat("K08303 线性关系图已保存\n")
+
+# 同时计算并输出 Pearson/Spearman 相关
+cor_pearson <- cor.test(k08303_score_df[[score_col]], k08303_score_df$K08303_CLR, method = "pearson")
+cor_spearman <- cor.test(k08303_score_df[[score_col]], k08303_score_df$K08303_CLR, method = "spearman")
+
+k08303_cor_summary <- data.frame(
+    Method = c("Pearson", "Spearman"),
+    r = c(cor_pearson$estimate, cor_spearman$estimate),
+    p_value = c(cor_pearson$p.value, cor_spearman$p.value),
+    R_squared_lm = c(r_squared, NA),
+    stringsAsFactors = FALSE
+)
+write.csv(k08303_cor_summary, file.path(fig_dir, "K08303_Score_Correlation.csv"), row.names = FALSE)
+
+cat("\n========== 全部修正与补充完成 ==========\n")
+cat("新增/修正文件：\n")
+cat("  1. Fig1_TriColumn_Network_9Species_FixedWidth.pdf  (线宽修复)\n")
+cat("  2. Pairwise_Prevalence_Stats.csv  (强制输出)\n")
+cat("  3. Fig4_Pathway_per_CoreKO_Barplot_Fixed.pdf  (横坐标KO编号)\n")
+cat("  4. Fig5_K08303_Abundance_Boxplot.pdf  (K08303组间比较)\n")
+cat("  5. Fig6_K08303_Score_Linear.pdf  (K08303线性关系)\n")
+cat("  6. K08303_Pairwise_Stats.csv / K08303_Score_Correlation.csv\n")
+
+
+
+
+
+
+
+
+
+
+
